@@ -2,9 +2,9 @@
 
 AWS Lambda that keeps Jamf Title Editor patch definitions current with vendor releases. Also handles apps Jamf has no built-in definition for.
 
-## The problem
+## Why
 
-Jamf's built-in patch definitions lag behind real releases. On June 4, 2026, Chrome 149.0.7827.54 had been out for two days but Jamf's built-in definition still showed 148.0.7778.216. Smart Groups scoping patch policies on that stale version target the wrong machines. This is a known issue in the MacAdmins community. Jamf can't keep up with apps like Chrome that push a new stable release every week or two.
+Jamf's built-in patch definitions lag behind real releases. On June 4, 2026, Chrome 149.0.7827.54 had been out for two days while Jamf's built-in definition still showed 148.0.7778.216. Smart Groups scoping patch policies on that stale version target the wrong machines. Chrome ships a new stable release every week or two, and the definitions don't keep up.
 
 Separately, Jamf has no built-in definition for many apps. If you deploy GMetrix or other niche software, there's no version tracking out of the box. As long as you can find a URL that exposes the current version number, this Lambda can create and maintain the patch definition.
 
@@ -41,7 +41,7 @@ Credentials are stored in AWS SSM Parameter Store (encrypted). Title Editor itse
 
 The included `apps.json` comes pre-configured for Google Chrome.
 
-Google publishes Chrome release data through their VersionHistory API. The API returns releases at various rollout stages, so a version might only be available to 50% of users. The config filters for `fraction=1` (100% rollout) to avoid flagging machines as outdated when they can't actually get the update yet. There's a slight delay (days, not weeks) before a new version shows up, but no false positives from partial rollouts.
+Google publishes Chrome release data through their VersionHistory API. The API returns releases at various rollout stages, so a version might only be available to 50% of users. The config filters for `fraction=1` (100% rollout) so machines don't get flagged as outdated before they can actually download the update. The tradeoff is that a new version shows up a few days late.
 
 The version source URL:
 
@@ -200,7 +200,7 @@ Don't use `python3 --version` or `/usr/bin/python3` to check the version. On mac
 
 After enabling the title in Jamf Pro, go to the patch title settings, click the Extension Attributes tab, and click Accept. Machines will start reporting their MacAdmins Python version on next check-in.
 
-The same `github_releases` + EA pattern covers other tools that live outside `/Applications`. Two variations worth knowing: when a project's release tag equals its `CFBundleVersion` exactly (e.g. Outset's `v4.3.0.22031`), track the full tag with no `version_parts` so the GitHub version and the EA line up; and when a tool ships as a bare command-line binary with no app bundle at all (e.g. utiluti at `/usr/local/bin/utiluti`), the EA reads the version by running the binary's `--version` instead of PlistBuddy - safe for a self-contained notarized binary, unlike `/usr/bin/python3`.
+The same `github_releases` + EA pattern covers other tools that live outside `/Applications`. If a project's release tag matches its `CFBundleVersion` exactly (Outset's `v4.3.0.22031`), track the full tag and skip `version_parts` so the GitHub version and the EA line up. If a tool ships as a bare command-line binary with no app bundle (utiluti at `/usr/local/bin/utiluti`), have the EA run the binary with `--version` instead of reading a plist. That's safe for a self-contained notarized binary, unlike `/usr/bin/python3`.
 
 ## ScreenConnect Client example (instance-specific version tracking)
 
@@ -266,7 +266,7 @@ GET https://sb.portal.cambiumast.com/geturls?clientName=washington&operatingSyst
   Location: https://.../WASecureBrowser18.0-2025-05-22-universal-signed.dmg?<presigned>
 ```
 
-The `redirect_filename` source type handles this. Unlike `html_scrape`, which follows redirects and reads the body, `redirect_filename` issues the request with redirects disabled and pulls the version out of the `Location` header's filename. It never downloads the (130 MB) DMG - it stops at the 301. The `regex` needs one capture group for the version.
+The `redirect_filename` source type handles this. Unlike `html_scrape`, which follows redirects and reads the body, `redirect_filename` issues the request with redirects disabled and pulls the version out of the `Location` header's filename. It stops at the 301 and never downloads the 130 MB DMG. The `regex` needs one capture group for the version.
 
 This app installs to `/Applications/WASecureBrowser.app` with a stable bundle ID, so it uses standard `recon` criteria (no Extension Attribute needed). `minimumOperatingSystem` is `10.15.0`, the browser's actual floor.
 
@@ -306,15 +306,15 @@ This app installs to `/Applications/WASecureBrowser.app` with a stable bundle ID
 
 The `clientName=washington` query parameter is state-specific; other states serve a different signed build. Never pin the S3 URL the redirect points at - it's a short-lived presigned URL regenerated per request. Always hit `geturls`.
 
-## Download-URL canary (catching broken installers)
+## Download-URL canary
 
 Separate from patch-version sync, the Lambda runs a download-URL health check on every invocation. This guards against a vendor silently changing or pulling the installer that an Installomator label (or any constructed-URL deploy) depends on.
 
-The motivating incident: on June 12, 2026, Adobe shipped Creative Cloud Desktop with a new build-path scheme and pulled the old object. Every Mac's auto-update push then 404'd, and the first signal was failed Jamf policies across a fleet of machines. A twice-daily GET on that URL would have caught it the same day.
+On June 12, 2026, Adobe shipped Creative Cloud Desktop under a new build path and pulled the old object. Every Mac's auto-update push then 404'd, and the first signal was failed Jamf policies. A twice-daily GET on that URL would have caught it the same day.
 
 The check replicates the exact URL the `adobecreativeclouddesktop` Installomator label builds: it reads Adobe's `ccdConfig.xml` (`greenline.latest`) for both `macarm64` and `osx10`, constructs the CC DMG URL, and issues a 1-byte range request. A `200`/`206` is healthy; anything else (a `404`) is a failure. It downloads zero bytes of the ~311 MB DMG.
 
-This is deliberately a liveness probe, not a patch title. Adobe's ESD build number (`6.10.0.252.3`) never matches the version Jamf inventories on disk (`6.10.0.253`), so a patch title synced from `ccdConfig` would be permanently, falsely "out of date." The Installomator label handles the install and the version comparison; this canary only answers "is the download still there."
+This is deliberately a health check, not a patch title. Adobe's ESD build number (`6.10.0.252.3`) never matches the version Jamf inventories on disk (`6.10.0.253`), so a patch title synced from `ccdConfig` would always show "out of date" even when the installed app is current. The Installomator label handles the install and the version comparison. The canary only checks that the download is still there.
 
 A failure emits the `DownloadUrlCheckFailures` metric and raises at the end of the run, so both the `Errors` alarm and the dedicated download-URL alarm email you (see [Monitoring](#monitoring)).
 
@@ -463,7 +463,7 @@ Verify in Title Editor that the version looks right, then check Jamf Pro > Compu
 
 ## Adding another app
 
-1. Add a new entry to `lambda/apps.json`. The worked examples above cover the common shapes - a standard `/Applications` app with recon criteria, HTML scraping, GitHub releases with an Extension Attribute, instance-specific tracking, and a version that only appears in a redirect's filename. Copy whichever one fits.
+1. Add a new entry to `lambda/apps.json`. The examples above cover the common cases - a standard `/Applications` app with recon criteria, HTML scraping, GitHub releases with an Extension Attribute, instance-specific tracking, and a version that only appears in a redirect's filename. Copy whichever one fits.
 
 2. Set the `version_source.type`:
    - `google_versionhistory` for JSON APIs that return a `releases` array (the Lambda reads `releases[0].version`)
@@ -515,7 +515,7 @@ Four CloudWatch alarms, all emailing via SNS:
 - Lambda has no function URL, no API Gateway, no public endpoint. Only EventBridge can invoke it.
 - Credentials stored in SSM Parameter Store as SecureStrings, encrypted with the AWS-managed KMS key.
 - Terraform creates SSM params with placeholders. Real values are set via CLI after deploy. `terraform.tfvars` is gitignored.
-- Lambda IAM role can only read its two specific SSM parameters and write to its own log group. Nothing else.
+- The Lambda IAM role can read its two SSM parameters, write to its own log group, and nothing else.
 - Version strings are validated against a regex before any Title Editor API call.
 - The handler never logs credentials or bearer tokens.
 
@@ -529,7 +529,7 @@ Title Editor doesn't support automated rotation, so this is manual:
 4. Test: `aws lambda invoke --function-name jamf-title-editor-sync /tmp/test.json`
 5. Log the rotation date
 
-No downtime. The Lambda gets a fresh token each run.
+There's no downtime, since the Lambda gets a fresh token each run.
 
 ## Running tests
 
