@@ -1,0 +1,19 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# Do NOT commit terraform.tfvars - it is in .gitignore.
+
+title_editor_url              = "https://yourorg.appcatalog.jamfcloud.com"
+title_editor_title_id         = "1"
+title_editor_gmetrix_title_id          = "2"
+title_editor_macadmins_python_title_id = "3"
+title_editor_screenconnect_title_id    = "4"
+title_editor_promethean_screen_share_title_id = "5"
+title_editor_wasecurebrowser_title_id         = "6"
+title_editor_outset_title_id                  = "7"
+title_editor_utiluti_title_id                 = "8"
+alert_email                   = "you@example.com"
+
+# Optional overrides (uncomment to change defaults):
+# aws_region          = "us-west-2"
+# schedule_timezone   = "America/Los_Angeles"
+# schedule_expression = "cron(0 6,18 * * ? *)"
+# log_retention_days  = 30

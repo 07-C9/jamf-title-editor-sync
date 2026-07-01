@@ -1,0 +1,343 @@
+[
+  {
+    "name": "Google Chrome",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_TITLE_ID",
+    "version_source": {
+      "type": "google_versionhistory",
+      "url": "https://versionhistory.googleapis.com/v1/chrome/platforms/mac/channels/stable/versions/all/releases?filter=fraction=1"
+    },
+    "version_pattern": "^\\d+\\.\\d+\\.\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "12.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "Google Chrome",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "Application Bundle ID",
+              "operator": "is",
+              "value": "com.google.Chrome",
+              "type": "recon"
+            },
+            {
+              "name": "Application Version",
+              "operator": "is",
+              "value": "{version}",
+              "type": "recon"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "12.0",
+          "type": "recon"
+        }
+      ]
+    }
+  },
+  {
+    "name": "GMetrix SMSe",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_GMETRIX_TITLE_ID",
+    "version_source": {
+      "type": "html_scrape",
+      "url": "https://www.gmetrix.net/GetGMetrixSMS.aspx",
+      "regex": "GMetrixSMSe-([0-9]+\\.[0-9]+\\.[0-9]+)-universal\\.dmg"
+    },
+    "version_pattern": "^\\d+\\.\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "12.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "GMetrix SMSe",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "Application Bundle ID",
+              "operator": "is",
+              "value": "com.skills.management.system.app",
+              "type": "recon"
+            },
+            {
+              "name": "Application Version",
+              "operator": "is",
+              "value": "{version}",
+              "type": "recon"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "12.0",
+          "type": "recon"
+        }
+      ]
+    }
+  },
+  {
+    "name": "MacAdmins Python",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_MACADMINS_PYTHON_TITLE_ID",
+    "version_source": {
+      "type": "github_releases",
+      "url": "https://api.github.com/repos/macadmins/python/releases/latest",
+      "version_parts": 3
+    },
+    "version_pattern": "^\\d+\\.\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "12.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "MacAdmins Python",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "patch-macadmins-python",
+              "operator": "is",
+              "value": "{version}",
+              "type": "extensionAttribute"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "12.0",
+          "type": "recon"
+        }
+      ]
+    }
+  },
+  {
+    "name": "ScreenConnect Client",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_SCREENCONNECT_TITLE_ID",
+    "version_source": {
+      "type": "html_scrape",
+      "url": "https://yourorg.screenconnect.com/Script.ashx",
+      "regex": "\"productVersion\":\"([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)\""
+    },
+    "version_pattern": "^\\d+\\.\\d+\\.\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "12.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "ScreenConnect Client",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "patch-screenconnect-client",
+              "operator": "is",
+              "value": "{version}",
+              "type": "extensionAttribute"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "12.0",
+          "type": "recon"
+        }
+      ]
+    }
+  },
+  {
+    "name": "Promethean Screen Share",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_PROMETHEAN_SCREEN_SHARE_TITLE_ID",
+    "version_source": {
+      "type": "html_scrape",
+      "url": "https://share.one.prometheanworld.com/config.js",
+      "regex": "VERSION:\\s*'([0-9]+\\.[0-9]+\\.[0-9]+)"
+    },
+    "version_pattern": "^\\d+\\.\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "12.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "Promethean Screen Share",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "Application Bundle ID",
+              "operator": "is",
+              "value": "cn.com.nd.pmcast",
+              "type": "recon"
+            },
+            {
+              "name": "Application Version",
+              "operator": "is",
+              "value": "{version}",
+              "type": "recon"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "12.0",
+          "type": "recon"
+        }
+      ]
+    }
+  },
+  {
+    "name": "Washington Secure Browser",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_WASECUREBROWSER_TITLE_ID",
+    "version_source": {
+      "type": "redirect_filename",
+      "url": "https://sb.portal.cambiumast.com/geturls?clientName=washington&operatingSystem=macOS",
+      "regex": "WASecureBrowser([0-9]+\\.[0-9]+)-[0-9-]+-universal-signed\\.dmg"
+    },
+    "version_pattern": "^\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "10.15.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "Washington Secure Browser",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "Application Bundle ID",
+              "operator": "is",
+              "value": "com.cambiumassessment.securebrowser",
+              "type": "recon"
+            },
+            {
+              "name": "Application Version",
+              "operator": "is",
+              "value": "{version}",
+              "type": "recon"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "10.15.0",
+          "type": "recon"
+        }
+      ]
+    }
+  },
+  {
+    "name": "Outset",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_OUTSET_TITLE_ID",
+    "version_source": {
+      "type": "github_releases",
+      "url": "https://api.github.com/repos/macadmins/outset/releases/latest"
+    },
+    "version_pattern": "^\\d+\\.\\d+\\.\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "10.15.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "Outset",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "patch-outset",
+              "operator": "is",
+              "value": "{version}",
+              "type": "extensionAttribute"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "10.15.0",
+          "type": "recon"
+        }
+      ]
+    }
+  },
+  {
+    "name": "utiluti",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_UTILUTI_TITLE_ID",
+    "version_source": {
+      "type": "github_releases",
+      "url": "https://api.github.com/repos/scriptingosx/utiluti/releases/latest"
+    },
+    "version_pattern": "^\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "11.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "utiluti",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "patch-utiluti",
+              "operator": "is",
+              "value": "{version}",
+              "type": "extensionAttribute"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "11.0",
+          "type": "recon"
+        }
+      ]
+    }
+  }
+]
