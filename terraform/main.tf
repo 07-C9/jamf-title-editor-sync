@@ -121,6 +121,12 @@ resource "aws_iam_role_policy" "lambda" {
           }
         }
       },
+      {
+        Sid      = "SNSFailureAlerts"
+        Effect   = "Allow"
+        Action   = "sns:Publish"
+        Resource = aws_sns_topic.alerts.arn
+      },
     ]
   })
 }
@@ -158,10 +164,18 @@ resource "aws_lambda_function" "patch_sync" {
       TITLE_EDITOR_UTILUTI_TITLE_ID                 = var.title_editor_utiluti_title_id
       SSM_USERNAME_PATH                             = aws_ssm_parameter.te_username.name
       SSM_PASSWORD_PATH                             = aws_ssm_parameter.te_password.name
+      ALERT_TOPIC_ARN                               = aws_sns_topic.alerts.arn
     }
   }
 
   depends_on = [aws_cloudwatch_log_group.lambda]
+}
+
+# Scheduled runs are idempotent and re-run within 12 hours; retrying a failed
+# async invocation only repeats the same failure and multiplies error noise.
+resource "aws_lambda_function_event_invoke_config" "patch_sync" {
+  function_name          = aws_lambda_function.patch_sync.function_name
+  maximum_retry_attempts = 0
 }
 
 resource "aws_lambda_permission" "scheduler" {
@@ -242,7 +256,7 @@ resource "aws_sns_topic_subscription" "email" {
 
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   alarm_name          = "${var.project_name}-errors"
-  alarm_description   = "Lambda function errors detected"
+  alarm_description   = "A twice-daily Title Editor sync run raised an error. The Lambda emails failure detail (which app, what error) to this same SNS topic; see that email or the Lambda logs. Missing data is ignored because the function only runs twice a day, so ALARM holds until a later run completes clean - the OK email means an actual clean run."
   namespace           = "AWS/Lambda"
   metric_name         = "Errors"
   statistic           = "Sum"
@@ -250,7 +264,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   evaluation_periods  = 1
   threshold           = 0
   comparison_operator = "GreaterThanThreshold"
-  treat_missing_data  = "notBreaching"
+  treat_missing_data  = "ignore"
 
   dimensions = {
     FunctionName = aws_lambda_function.patch_sync.function_name
@@ -262,7 +276,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
 
 resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   alarm_name          = "${var.project_name}-duration"
-  alarm_description   = "Lambda execution approaching timeout"
+  alarm_description   = "A Title Editor sync run took over 25s of the 30s timeout - a vendor endpoint is probably hanging. Check the Lambda logs for which app was slow. Missing data is ignored (function runs twice a day); ALARM holds until a later run finishes fast."
   namespace           = "AWS/Lambda"
   metric_name         = "Duration"
   statistic           = "Maximum"
@@ -270,7 +284,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   evaluation_periods  = 1
   threshold           = 25000
   comparison_operator = "GreaterThanThreshold"
-  treat_missing_data  = "notBreaching"
+  treat_missing_data  = "ignore"
 
   dimensions = {
     FunctionName = aws_lambda_function.patch_sync.function_name

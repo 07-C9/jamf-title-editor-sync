@@ -1054,6 +1054,129 @@ class TestUtilutiPatchBody(unittest.TestCase):
         self.assertIn("releaseDate", body)
 
 
+class TestBuildFailureAlert(unittest.TestCase):
+
+    def test_subject_and_body_carry_failure_detail(self):
+        handler = _reload_handler()
+        results = [
+            {"app": "Google Chrome", "status": "current", "version": "150.0.7871.115"},
+            {"app": "GMetrix SMSe", "status": "failed", "error": "No version found for GMetrix SMSe"},
+            {"app": "Outset", "status": "updated", "from": "4.2.0", "to": "4.3.0.22031"},
+        ]
+        subject, body = handler._build_failure_alert(
+            results, ["GMetrix SMSe"], [], "req-123"
+        )
+        self.assertIn("FAILED", subject)
+        self.assertIn("GMetrix SMSe", subject)
+        self.assertIn("GMetrix SMSe: No version found for GMetrix SMSe", body)
+        self.assertIn("Google Chrome: current at 150.0.7871.115", body)
+        self.assertIn("Outset: updated 4.2.0 -> 4.3.0.22031", body)
+        self.assertIn("req-123", body)
+        self.assertIn("$252Faws$252Flambda$252Fjamf-title-editor-sync", body)
+
+    def test_subject_stays_under_sns_limit(self):
+        handler = _reload_handler()
+        names = [f"Application Number {i}" for i in range(12)]
+        results = [{"app": n, "status": "failed", "error": "boom"} for n in names]
+        subject, _ = handler._build_failure_alert(results, names, [], "req-123")
+        self.assertLessEqual(len(subject), 100)
+
+    def test_download_only_failure_named_in_subject(self):
+        handler = _reload_handler()
+        detail = "Adobe CC macarm64: download URL not live (6.10.0) https://x/y.dmg"
+        results = [
+            {"app": "Google Chrome", "status": "current", "version": "150.0.7871.115"},
+            {"check": "download_url", "status": "failed", "detail": detail},
+        ]
+        subject, body = handler._build_failure_alert(results, [], [detail], "req-123")
+        self.assertIn("download URL checks", subject)
+        self.assertIn(detail, body)
+
+
+class TestFailureAlertPublish(unittest.TestCase):
+
+    TOPIC = "arn:aws:sns:us-west-2:111122223333:test-alerts"
+
+    def setUp(self):
+        self.handler = _reload_handler()
+        _disable_download_checks(self)
+        self._apps = self.handler.APPS
+        self.handler.APPS = [a for a in self.handler.APPS if a["name"] == "Google Chrome"]
+        os.environ["ALERT_TOPIC_ARN"] = self.TOPIC
+        self.addCleanup(os.environ.pop, "ALERT_TOPIC_ARN", None)
+
+        self.mock_ssm = MagicMock()
+        self.mock_ssm.get_parameter.side_effect = [
+            {"Parameter": {"Value": "testuser"}},
+            {"Parameter": {"Value": "testpass"}},
+        ]
+        self.mock_sns = MagicMock()
+
+    def tearDown(self):
+        self.handler.APPS = self._apps
+
+    def _boto_router(self):
+        def route(svc):
+            if svc == "ssm":
+                return self.mock_ssm
+            if svc == "sns":
+                return self.mock_sns
+            return MagicMock()
+        return route
+
+    def _failing_run_responses(self):
+        token_resp = _make_response({"token": "test-bearer-token"})
+        bad_version = _make_response({"releases": [{"version": "149.0.7827"}]})
+        return [token_resp, bad_version]
+
+    def test_failed_run_publishes_detail_and_still_raises(self):
+        ctx_obj = types.SimpleNamespace(aws_request_id="req-e2e-42")
+        with patch("handler.urllib.request.urlopen", side_effect=self._failing_run_responses()):
+            with patch("handler.boto3.client", side_effect=self._boto_router()):
+                with self.assertRaises(RuntimeError):
+                    self.handler.lambda_handler({}, ctx_obj)
+
+        self.mock_sns.publish.assert_called_once()
+        kwargs = self.mock_sns.publish.call_args.kwargs
+        self.assertEqual(kwargs["TopicArn"], self.TOPIC)
+        self.assertIn("Google Chrome", kwargs["Subject"])
+        self.assertIn("does not match", kwargs["Message"])
+        self.assertIn("req-e2e-42", kwargs["Message"])
+
+    def test_missing_topic_env_var_skips_publish_and_still_raises(self):
+        os.environ.pop("ALERT_TOPIC_ARN", None)
+        with patch("handler.urllib.request.urlopen", side_effect=self._failing_run_responses()):
+            with patch("handler.boto3.client", side_effect=self._boto_router()) as boto_mock:
+                with self.assertRaises(RuntimeError):
+                    self.handler.lambda_handler({}, None)
+
+        requested_services = [c.args[0] for c in boto_mock.call_args_list]
+        self.assertNotIn("sns", requested_services)
+
+    def test_publish_error_is_logged_and_does_not_mask_run_failure(self):
+        self.mock_sns.publish.side_effect = Exception("sns is down")
+        with patch("handler.urllib.request.urlopen", side_effect=self._failing_run_responses()):
+            with patch("handler.boto3.client", side_effect=self._boto_router()):
+                with self.assertLogs(level="ERROR") as logs:
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self.handler.lambda_handler({}, None)
+
+        self.assertIn("Google Chrome", str(ctx.exception))
+        self.assertTrue(any("failure alert" in m for m in logs.output))
+
+    def test_clean_run_does_not_publish(self):
+        token_resp = _make_response({"token": "test-bearer-token"})
+        version_resp = _make_response({"releases": [{"version": "149.0.7827.54", "fraction": 1}]})
+        title_resp = _make_response({"currentVersion": "149.0.7827.54", "enabled": True, "patches": []})
+        with patch("handler.urllib.request.urlopen", side_effect=[token_resp, version_resp, title_resp]):
+            with patch("handler.boto3.client", side_effect=self._boto_router()) as boto_mock:
+                result = self.handler.lambda_handler({}, None)
+
+        self.assertEqual(result["statusCode"], 200)
+        requested_services = [c.args[0] for c in boto_mock.call_args_list]
+        self.assertNotIn("sns", requested_services)
+
+
 class TestTitleEditorAuth(unittest.TestCase):
 
     def test_uses_basic_auth_header(self):

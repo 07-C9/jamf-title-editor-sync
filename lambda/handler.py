@@ -278,6 +278,51 @@ def _run_download_checks():
     return failures
 
 
+def _build_failure_alert(results, failures, download_failures, request_id):
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "jamf-title-editor-sync")
+    region = os.environ.get("AWS_REGION", "us-west-2")
+    log_group = os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME", f"/aws/lambda/{function_name}")
+
+    subject = f"{function_name} FAILED: {', '.join(failures) or 'download URL checks'}"
+    if len(subject) > 100:
+        subject = subject[:97] + "..."
+
+    lines = [f"{function_name} run failed. Only the items under 'Failed' need attention.", ""]
+    lines.append("Failed:")
+    for r in results:
+        if r.get("status") != "failed":
+            continue
+        if "app" in r:
+            lines.append(f"  - {r['app']}: {r['error']}")
+        else:
+            lines.append(f"  - {r['detail']}")
+    ok = [r for r in results if r.get("status") in ("current", "updated")]
+    lines.append("")
+    lines.append(f"OK this run ({len(ok)}):")
+    for r in ok:
+        if r["status"] == "current":
+            lines.append(f"  - {r['app']}: current at {r['version']}")
+        else:
+            lines.append(f"  - {r['app']}: updated {r['from']} -> {r['to']}")
+    log_url = (
+        f"https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}"
+        f"#logsV2:log-groups/log-group/{log_group.replace('/', '$252F')}"
+    )
+    lines += ["", f"Request ID: {request_id}", f"Logs: {log_url}"]
+    return subject, "\n".join(lines)
+
+
+def _publish_failure_alert(results, failures, download_failures, request_id):
+    topic_arn = os.environ.get("ALERT_TOPIC_ARN")
+    if not topic_arn:
+        return
+    subject, body = _build_failure_alert(results, failures, download_failures, request_id)
+    try:
+        boto3.client("sns").publish(TopicArn=topic_arn, Subject=subject, Message=body)
+    except Exception as e:
+        logger.error(f"Could not publish failure alert to SNS: {e}")
+
+
 def lambda_handler(event, context):
     base_url = os.environ["TITLE_EDITOR_URL"].rstrip("/")
     username, password = _get_credentials()
@@ -325,6 +370,10 @@ def lambda_handler(event, context):
     )
 
     if failures or download_failures:
+        _publish_failure_alert(
+            results, failures, download_failures,
+            getattr(context, "aws_request_id", "unknown"),
+        )
         raise RuntimeError(
             f"Version sync failed for: {', '.join(failures) or 'none'}; "
             f"download checks failed: {'; '.join(download_failures) or 'none'}"

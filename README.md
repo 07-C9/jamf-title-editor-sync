@@ -507,11 +507,15 @@ Four CloudWatch alarms, all emailing via SNS:
 - No invocations (24h): Scheduler stopped firing (deleted, misconfigured)
 - Download-URL failure: the canary found a dead installer URL (e.g. an Adobe CC build-path change), reported via the `DownloadUrlCheckFailures` metric
 
+When a run fails, the Lambda also emails the detail to the same topic before it raises: which apps failed and why, what succeeded, and a link to the logs. The alarm email only says the run broke; the detail email says which app and what error.
+
+The Errors and Duration alarms ignore missing data because the function only runs twice a day. Once one fires it stays in ALARM until a later run posts a clean datapoint, so an OK email means a later run came back clean. Async retries are off; retrying a broken version source a minute later fails the same way, so a failed run just waits for the next scheduled one.
+
 ### When you get an alert
 
 | Alert | Likely cause | What to do |
 |-------|-------------|------------|
-| Lambda error | Auth failure, API change, network | Check CloudWatch Logs |
+| Lambda error | One app's version source broke, auth failure, API change | Read the failure email for the app and error; CloudWatch Logs for the stack trace |
 | No invocations | EventBridge schedule gone | `aws scheduler get-schedule --name jamf-title-editor-sync-schedule` |
 | Duration | Slow API response | Consider bumping the Lambda timeout |
 | Download-URL failure | Vendor changed or pulled an installer URL | Check CloudWatch Logs for the failing arch/URL, fix the Installomator label, re-verify |
