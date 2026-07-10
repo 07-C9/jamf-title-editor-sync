@@ -156,7 +156,7 @@ resource "aws_lambda_function" "patch_sync" {
   role             = aws_iam_role.lambda.arn
   handler          = "handler.lambda_handler"
   runtime          = "python3.13"
-  timeout          = 30
+  timeout          = 60
   memory_size      = 128
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256
@@ -290,13 +290,13 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
 
 resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   alarm_name          = "${var.project_name}-duration"
-  alarm_description   = "A Title Editor sync run took over 25s of the 30s timeout - a vendor endpoint is probably hanging. Check the Lambda logs for which app was slow. Missing data is ignored (function runs twice a day); ALARM holds until a later run finishes fast."
+  alarm_description   = "A Title Editor sync run took over 50s of the 60s timeout - a vendor or Jamf Pro endpoint is probably hanging (healthy runs with the drift check take ~21s). Check the Lambda logs for which call was slow. Missing data is ignored (function runs twice a day); ALARM holds until a later run finishes fast."
   namespace           = "AWS/Lambda"
   metric_name         = "Duration"
   statistic           = "Maximum"
   period              = 300
   evaluation_periods  = 1
-  threshold           = 25000
+  threshold           = 50000
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "ignore"
 
