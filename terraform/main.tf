@@ -85,13 +85,18 @@ resource "aws_iam_role" "lambda" {
   })
 }
 
+data "aws_secretsmanager_secret" "jamf_pro_readonly" {
+  count = var.jamf_pro_secret_name != "" ? 1 : 0
+  name  = var.jamf_pro_secret_name
+}
+
 resource "aws_iam_role_policy" "lambda" {
   name = "${var.project_name}-lambda-policy"
   role = aws_iam_role.lambda.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid    = "SSMReadCredentials"
         Effect = "Allow"
@@ -127,7 +132,14 @@ resource "aws_iam_role_policy" "lambda" {
         Action   = "sns:Publish"
         Resource = aws_sns_topic.alerts.arn
       },
-    ]
+      ],
+      var.jamf_pro_secret_name != "" ? [{
+        Sid      = "JamfProReadonlySecret"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = data.aws_secretsmanager_secret.jamf_pro_readonly[0].arn
+      }] : []
+    )
   })
 }
 
@@ -165,6 +177,8 @@ resource "aws_lambda_function" "patch_sync" {
       SSM_USERNAME_PATH                             = aws_ssm_parameter.te_username.name
       SSM_PASSWORD_PATH                             = aws_ssm_parameter.te_password.name
       ALERT_TOPIC_ARN                               = aws_sns_topic.alerts.arn
+      JAMF_PRO_URL                                  = var.jamf_pro_url
+      JAMF_PRO_SECRET_ID                            = var.jamf_pro_secret_name
     }
   }
 
@@ -310,6 +324,23 @@ resource "aws_cloudwatch_metric_alarm" "no_invocations" {
   }
 
   alarm_actions = [aws_sns_topic.alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "jamfpro_definition_lag" {
+  count               = var.jamf_pro_url != "" ? 1 : 0
+  alarm_name          = "${var.project_name}-jamfpro-definition-lag"
+  alarm_description   = "Jamf Pro's ingested patch definitions have diverged from Title Editor for two consecutive sync runs (roughly 24 hours). Brief lag right after a version push is normal (Jamf Pro polls Title Editor on its own schedule) and will not fire this. Persistent divergence means Jamf Pro stopped pulling from Title Editor: re-save the external patch source under Settings > Computer management > Patch management to force the M2M reconnect, then confirm the next runs post JamfProDefinitionLag=0. Metric comes from the sync Lambda's drift check; the run's 'lagging' log lines name the titles."
+  namespace           = "JamfPatchSync"
+  metric_name         = "JamfProDefinitionLag"
+  statistic           = "Minimum"
+  period              = 43200
+  evaluation_periods  = 2
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "ignore"
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+  ok_actions    = [aws_sns_topic.alerts.arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "download_url_failures" {

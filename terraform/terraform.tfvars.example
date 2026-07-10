@@ -17,3 +17,7 @@ alert_email                   = "you@example.com"
 # schedule_timezone   = "America/Los_Angeles"
 # schedule_expression = "cron(0 6,18 * * ? *)"
 # log_retention_days  = 30
+
+# Optional: enables the Jamf Pro definition drift check (leave out to disable)
+jamf_pro_url         = "https://yourorg.jamfcloud.com"
+jamf_pro_secret_name = "jamf-title-editor-sync/jamf-pro-readonly"

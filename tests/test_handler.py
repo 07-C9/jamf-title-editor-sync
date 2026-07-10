@@ -1177,6 +1177,242 @@ class TestFailureAlertPublish(unittest.TestCase):
         self.assertNotIn("sns", requested_services)
 
 
+JAMF_PRO_V2_CONFIGS = [
+    {"id": "201", "displayName": "Google Chrome", "jamfOfficial": False, "softwareTitleId": "201"},
+    {"id": "205", "displayName": "ScreenConnect Agent", "jamfOfficial": False, "softwareTitleId": "205"},
+    {"id": "150", "displayName": "Zoom Client for Meetings", "jamfOfficial": True, "softwareTitleId": "0DF"},
+]
+
+JAMF_PRO_XML_CHROME = """<?xml version="1.0" encoding="UTF-8"?>
+<patch_software_title>
+  <id>201</id>
+  <name>Google Chrome</name>
+  <name_id>googlechrome</name_id>
+  <source_id>2</source_id>
+  <versions>
+    <version><software_version>150.0.7871.115</software_version></version>
+    <version><software_version>150.0.7871.101</software_version></version>
+  </versions>
+</patch_software_title>"""
+
+JAMF_PRO_XML_SCREENCONNECT = """<?xml version="1.0" encoding="UTF-8"?>
+<patch_software_title>
+  <id>205</id>
+  <name>ScreenConnect Agent</name>
+  <name_id>screenconnectclient</name_id>
+  <source_id>2</source_id>
+  <versions>
+    <version><software_version>26.1.24.9579</software_version></version>
+  </versions>
+</patch_software_title>"""
+
+
+class TestJamfProDriftCheck(unittest.TestCase):
+
+    def setUp(self):
+        self.handler = _reload_handler()
+        os.environ["JAMF_PRO_URL"] = "https://jamf.test:8443"
+        os.environ["JAMF_PRO_SECRET_ID"] = "test/jamf-pro-readonly"
+        self.addCleanup(os.environ.pop, "JAMF_PRO_URL", None)
+        self.addCleanup(os.environ.pop, "JAMF_PRO_SECRET_ID", None)
+
+        self.mock_secrets = MagicMock()
+        self.mock_secrets.get_secret_value.return_value = {
+            "SecretString": json.dumps({"client_id": "cid", "client_secret": "csec"})
+        }
+
+    def _drift_responses(self, xml_bodies):
+        token_resp = _make_response({"access_token": "jp-token", "expires_in": 1200})
+        v2_resp = _make_response(JAMF_PRO_V2_CONFIGS)
+        return [token_resp, v2_resp] + [_make_response(x, raw=True) for x in xml_bodies]
+
+    def test_synced_titles_report_no_drift(self):
+        te_state = {
+            "googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"},
+            "screenconnectclient": {"app": "ScreenConnect Client", "version": "26.1.24.9579"},
+        }
+        responses = self._drift_responses([JAMF_PRO_XML_CHROME, JAMF_PRO_XML_SCREENCONNECT])
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                drifted = self.handler._run_jamf_pro_drift_check(te_state)
+        self.assertEqual(drifted, [])
+
+    def test_diverged_title_reported_with_both_versions(self):
+        te_state = {
+            "googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"},
+            "screenconnectclient": {"app": "ScreenConnect Client", "version": "26.3.11.9650"},
+        }
+        responses = self._drift_responses([JAMF_PRO_XML_CHROME, JAMF_PRO_XML_SCREENCONNECT])
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                drifted = self.handler._run_jamf_pro_drift_check(te_state)
+        self.assertEqual(len(drifted), 1)
+        self.assertIn("ScreenConnect Client", drifted[0])
+        self.assertIn("26.1.24.9579", drifted[0])
+        self.assertIn("26.3.11.9650", drifted[0])
+
+    def test_unknown_name_id_ignored(self):
+        te_state = {"googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"}}
+        responses = self._drift_responses([JAMF_PRO_XML_CHROME, JAMF_PRO_XML_SCREENCONNECT])
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                drifted = self.handler._run_jamf_pro_drift_check(te_state)
+        self.assertEqual(drifted, [])
+
+    def test_xml_with_dtd_rejected(self):
+        te_state = {"googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"}}
+        evil = '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><patch_software_title/>'
+        v2_one_config = [{"id": "201", "displayName": "Google Chrome", "jamfOfficial": False}]
+        responses = [
+            _make_response({"access_token": "jp-token"}),
+            _make_response(v2_one_config),
+            _make_response(evil, raw=True),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                with self.assertRaises(ValueError) as ctx:
+                    self.handler._run_jamf_pro_drift_check(te_state)
+        self.assertIn("DTD", str(ctx.exception))
+
+    def test_oauth_posts_client_credentials_form(self):
+        with patch("handler.urllib.request.urlopen", return_value=_make_response({"access_token": "jp-token"})) as urlopen_mock:
+            token = self.handler._get_jamf_pro_token("https://jamf.test:8443", "cid", "csec")
+        self.assertEqual(token, "jp-token")
+        req = urlopen_mock.call_args[0][0]
+        body = req.data.decode()
+        self.assertIn("grant_type=client_credentials", body)
+        self.assertIn("client_id=cid", body)
+        self.assertIn("client_secret=csec", body)
+        self.assertEqual(req.get_header("Content-type"), "application/x-www-form-urlencoded")
+
+
+class TestLambdaHandlerDriftIntegration(unittest.TestCase):
+
+    def setUp(self):
+        self.handler = _reload_handler()
+        _disable_download_checks(self)
+        self._apps = self.handler.APPS
+        self.handler.APPS = [a for a in self.handler.APPS if a["name"] == "Google Chrome"]
+
+        self.mock_ssm = MagicMock()
+        self.mock_ssm.get_parameter.side_effect = [
+            {"Parameter": {"Value": "testuser"}},
+            {"Parameter": {"Value": "testpass"}},
+        ]
+        self.mock_secrets = MagicMock()
+        self.mock_secrets.get_secret_value.return_value = {
+            "SecretString": json.dumps({"client_id": "cid", "client_secret": "csec"})
+        }
+        self.cloudwatch = MagicMock()
+        self.mock_sns = MagicMock()
+
+    def tearDown(self):
+        self.handler.APPS = self._apps
+
+    def _boto_router(self):
+        def route(svc):
+            return {
+                "ssm": self.mock_ssm,
+                "secretsmanager": self.mock_secrets,
+                "cloudwatch": self.cloudwatch,
+                "sns": self.mock_sns,
+            }.get(svc, MagicMock())
+        return route
+
+    def _sync_responses(self):
+        token_resp = _make_response({"token": "te-token"})
+        version_resp = _make_response({"releases": [{"version": "150.0.7871.115", "fraction": 1}]})
+        title_resp = _make_response({
+            "id": "googlechrome", "currentVersion": "150.0.7871.115",
+            "enabled": True, "patches": [],
+        })
+        return [token_resp, version_resp, title_resp]
+
+    def _lag_metric_values(self):
+        return [
+            c.kwargs["MetricData"][0]["Value"]
+            for c in self.cloudwatch.put_metric_data.call_args_list
+            if c.kwargs["MetricData"][0]["MetricName"] == "JamfProDefinitionLag"
+        ]
+
+    def test_drift_check_skipped_without_config(self):
+        os.environ.pop("JAMF_PRO_URL", None)
+        os.environ.pop("JAMF_PRO_SECRET_ID", None)
+        with patch("handler.urllib.request.urlopen", side_effect=self._sync_responses()) as urlopen_mock:
+            with patch("handler.boto3.client", side_effect=self._boto_router()):
+                result = self.handler.lambda_handler({}, None)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(urlopen_mock.call_count, 3)
+        self.assertEqual(self._lag_metric_values(), [])
+
+    def test_lagging_title_emits_metric_and_result_but_run_succeeds(self):
+        os.environ["JAMF_PRO_URL"] = "https://jamf.test:8443"
+        os.environ["JAMF_PRO_SECRET_ID"] = "test/jamf-pro-readonly"
+        self.addCleanup(os.environ.pop, "JAMF_PRO_URL", None)
+        self.addCleanup(os.environ.pop, "JAMF_PRO_SECRET_ID", None)
+
+        stale_chrome_xml = JAMF_PRO_XML_CHROME.replace("150.0.7871.115", "150.0.7871.101")
+        v2_one_config = [{"id": "201", "displayName": "Google Chrome", "jamfOfficial": False}]
+        responses = self._sync_responses() + [
+            _make_response({"access_token": "jp-token"}),
+            _make_response(v2_one_config),
+            _make_response(stale_chrome_xml, raw=True),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", side_effect=self._boto_router()):
+                result = self.handler.lambda_handler({}, None)
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(self._lag_metric_values(), [1])
+        lag_entries = [r for r in result["results"] if r.get("status") == "lagging"]
+        self.assertEqual(len(lag_entries), 1)
+        self.assertIn("Google Chrome", lag_entries[0]["detail"])
+        self.mock_sns.publish.assert_not_called()
+
+    def test_synced_title_emits_zero_metric(self):
+        os.environ["JAMF_PRO_URL"] = "https://jamf.test:8443"
+        os.environ["JAMF_PRO_SECRET_ID"] = "test/jamf-pro-readonly"
+        self.addCleanup(os.environ.pop, "JAMF_PRO_URL", None)
+        self.addCleanup(os.environ.pop, "JAMF_PRO_SECRET_ID", None)
+
+        v2_one_config = [{"id": "201", "displayName": "Google Chrome", "jamfOfficial": False}]
+        responses = self._sync_responses() + [
+            _make_response({"access_token": "jp-token"}),
+            _make_response(v2_one_config),
+            _make_response(JAMF_PRO_XML_CHROME, raw=True),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", side_effect=self._boto_router()):
+                result = self.handler.lambda_handler({}, None)
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(self._lag_metric_values(), [0])
+
+    def test_drift_check_error_fails_run_with_detail_email(self):
+        os.environ["JAMF_PRO_URL"] = "https://jamf.test:8443"
+        os.environ["JAMF_PRO_SECRET_ID"] = "test/jamf-pro-readonly"
+        os.environ["ALERT_TOPIC_ARN"] = "arn:aws:sns:us-west-2:111122223333:test-alerts"
+        self.addCleanup(os.environ.pop, "JAMF_PRO_URL", None)
+        self.addCleanup(os.environ.pop, "JAMF_PRO_SECRET_ID", None)
+        self.addCleanup(os.environ.pop, "ALERT_TOPIC_ARN", None)
+
+        import urllib.error
+        responses = self._sync_responses() + [
+            urllib.error.HTTPError("https://jamf.test:8443/api/oauth/token", 503,
+                                   "Service Unavailable", {}, io.BytesIO(b"")),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", side_effect=self._boto_router()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.handler.lambda_handler({}, None)
+
+        self.assertIn("Jamf Pro drift check", str(ctx.exception))
+        self.mock_sns.publish.assert_called_once()
+        message = self.mock_sns.publish.call_args.kwargs["Message"]
+        self.assertIn("Jamf Pro drift check", message)
+        self.assertIn("503", message)
+
+
 class TestTitleEditorAuth(unittest.TestCase):
 
     def test_uses_basic_auth_header(self):

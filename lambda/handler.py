@@ -9,7 +9,9 @@ import logging
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -278,6 +280,82 @@ def _run_download_checks():
     return failures
 
 
+_cached_jamf_pro_creds = None
+
+
+def _get_jamf_pro_credentials():
+    global _cached_jamf_pro_creds
+    if _cached_jamf_pro_creds is not None:
+        return _cached_jamf_pro_creds
+    secret = boto3.client("secretsmanager").get_secret_value(
+        SecretId=os.environ["JAMF_PRO_SECRET_ID"]
+    )
+    data = json.loads(secret["SecretString"])
+    _cached_jamf_pro_creds = (data["client_id"], data["client_secret"])
+    return _cached_jamf_pro_creds
+
+
+def _get_jamf_pro_token(base_url, client_id, client_secret):
+    body = urllib.parse.urlencode({
+        "client_id": client_id,
+        "grant_type": "client_credentials",
+        "client_secret": client_secret,
+    }).encode()
+    req = urllib.request.Request(
+        f"{base_url}/api/oauth/token",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=body,
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())["access_token"]
+
+
+def _jamf_pro_get(base_url, token, path, accept):
+    req = urllib.request.Request(
+        f"{base_url}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": accept},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read()
+
+
+def _run_jamf_pro_drift_check(te_state):
+    """Compares Jamf Pro's latest ingested definition for each Title Editor
+    title (matched by name_id == the TE title slug) against the version this
+    run confirmed in Title Editor. Returns divergence strings (empty = current)."""
+    base_url = os.environ["JAMF_PRO_URL"].rstrip("/")
+    client_id, client_secret = _get_jamf_pro_credentials()
+    token = _get_jamf_pro_token(base_url, client_id, client_secret)
+
+    configs = json.loads(_jamf_pro_get(
+        base_url, token, "/api/v2/patch-software-title-configurations", "application/json"
+    ))
+    drifted = []
+    for config in configs:
+        if config.get("jamfOfficial", True):
+            continue
+        xml_body = _jamf_pro_get(
+            base_url, token,
+            f"/JSSResource/patchsoftwaretitles/id/{config['id']}", "application/xml",
+        )
+        # Jamf Pro classic API responses never carry a DTD; refuse any that do
+        # rather than expose the parser to entity-expansion tricks.
+        if b"<!DOCTYPE" in xml_body or b"<!ENTITY" in xml_body:
+            raise ValueError(f"Unexpected DTD in Jamf Pro XML for config {config['id']}")
+        root = ET.fromstring(xml_body)
+        te_entry = te_state.get(root.findtext("name_id"))
+        if te_entry is None:
+            continue
+        jamf_latest = root.findtext("versions/version/software_version")
+        if jamf_latest != te_entry["version"]:
+            drifted.append(
+                f"{te_entry['app']} (Jamf Pro has {jamf_latest}, "
+                f"Title Editor has {te_entry['version']})"
+            )
+    return drifted
+
+
 def _build_failure_alert(results, failures, download_failures, request_id):
     function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "jamf-title-editor-sync")
     region = os.environ.get("AWS_REGION", "us-west-2")
@@ -330,6 +408,7 @@ def lambda_handler(event, context):
 
     results = []
     failures = []
+    te_state = {}
     for app in APPS:
         if not app.get("enabled", True):
             logger.info(f"Skipping disabled app: {app['name']}")
@@ -350,6 +429,9 @@ def lambda_handler(event, context):
                 _update_title(base_url, token, title_id, latest, app, latest in existing_versions)
                 results.append({"app": app["name"], "status": "updated", "from": current, "to": latest})
 
+            if title_info.get("id"):
+                te_state[title_info["id"]] = {"app": app["name"], "version": latest}
+
         except Exception as e:
             logger.error(f"{app['name']}: failed - {e}")
             failures.append(app["name"])
@@ -368,6 +450,28 @@ def lambda_handler(event, context):
             "Unit": "Count",
         }],
     )
+
+    if os.environ.get("JAMF_PRO_URL") and os.environ.get("JAMF_PRO_SECRET_ID"):
+        try:
+            drifted = _run_jamf_pro_drift_check(te_state)
+            for item in drifted:
+                logger.warning(f"Jamf Pro definition lag: {item}")
+                results.append({"check": "jamfpro_drift", "status": "lagging", "detail": item})
+            boto3.client("cloudwatch").put_metric_data(
+                Namespace="JamfPatchSync",
+                MetricData=[{
+                    "MetricName": "JamfProDefinitionLag",
+                    "Value": len(drifted),
+                    "Unit": "Count",
+                }],
+            )
+        except Exception as e:
+            logger.error(f"Jamf Pro drift check failed - {e}")
+            failures.append("Jamf Pro drift check")
+            results.append({
+                "check": "jamfpro_drift", "status": "failed",
+                "detail": f"Jamf Pro drift check: {e}",
+            })
 
     if failures or download_failures:
         _publish_failure_alert(

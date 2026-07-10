@@ -51,6 +51,18 @@ variable "alert_email" {
   type        = string
 }
 
+variable "jamf_pro_url" {
+  description = "Jamf Pro base URL for the definition drift check (e.g., https://yourorg.jamfcloud.com). Leave empty to disable the check."
+  type        = string
+  default     = ""
+}
+
+variable "jamf_pro_secret_name" {
+  description = "Secrets Manager secret holding a read-only Jamf Pro API client as JSON keys client_id and client_secret (needs Read Patch Management Software Titles). Leave empty to disable the drift check."
+  type        = string
+  default     = ""
+}
+
 variable "aws_region" {
   description = "AWS region to deploy into"
   type        = string
