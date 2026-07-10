@@ -114,6 +114,16 @@ def _fetch_version_redirect(url, regex, app_name):
     return match.group(1)
 
 
+def _fetch_version_electron_feed(url, app_name):
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        text = resp.read().decode()
+    match = re.search(r"(?m)^version:\s*['\"]?([0-9][0-9A-Za-z.+-]*)['\"]?\s*$", text)
+    if not match:
+        raise ValueError(f"No version found for {app_name}")
+    return match.group(1)
+
+
 def _fetch_latest_version(app_config):
     source = app_config["version_source"]
     source_type = source["type"]
@@ -127,6 +137,8 @@ def _fetch_latest_version(app_config):
         version = _fetch_version_github(source["url"], source.get("version_parts"), name)
     elif source_type == "redirect_filename":
         version = _fetch_version_redirect(source["url"], source["regex"], name)
+    elif source_type == "electron_updater_feed":
+        version = _fetch_version_electron_feed(source["url"], name)
     else:
         raise ValueError(f"Unknown version source type: {source_type}")
 

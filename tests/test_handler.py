@@ -350,6 +350,49 @@ class TestFetchVersionHtmlScrape(unittest.TestCase):
         self.assertIn("Unknown version source type", str(ctx.exception))
 
 
+class TestFetchVersionElectronUpdaterFeed(unittest.TestCase):
+
+    def _make_feed_app_config(self):
+        return {
+            "name": "GMetrix SMSe",
+            "version_source": {
+                "type": "electron_updater_feed",
+                "url": "https://releases.gmetrix.net/smse/latest/mac/latest-mac.yml",
+            },
+            "version_pattern": "^\\d+\\.\\d+\\.\\d+$",
+        }
+
+    def test_valid_feed_version(self):
+        handler = _reload_handler()
+        app_config = self._make_feed_app_config()
+        feed = (
+            "version: 7.1.17\n"
+            "files:\n"
+            "  - url: GMetrixSMSe-7.1.17-universal.dmg\n"
+            "    version: 0.0.0-decoy\n"
+            "releaseDate: '2026-07-09T14:02:49.811Z'\n"
+        )
+        with patch("handler.urllib.request.urlopen", return_value=_make_response(feed, raw=True)):
+            version = handler._fetch_latest_version(app_config)
+            self.assertEqual(version, "7.1.17")
+
+    def test_feed_quoted_version(self):
+        handler = _reload_handler()
+        app_config = self._make_feed_app_config()
+        feed = "version: '7.1.17'\nreleaseDate: '2026-07-09T14:02:49.811Z'\n"
+        with patch("handler.urllib.request.urlopen", return_value=_make_response(feed, raw=True)):
+            self.assertEqual(handler._fetch_latest_version(app_config), "7.1.17")
+
+    def test_feed_no_version_raises(self):
+        handler = _reload_handler()
+        app_config = self._make_feed_app_config()
+        feed = "files:\n  - url: GMetrixSMSe.dmg\n"
+        with patch("handler.urllib.request.urlopen", return_value=_make_response(feed, raw=True)):
+            with self.assertRaises(ValueError) as ctx:
+                handler._fetch_latest_version(app_config)
+            self.assertIn("No version found", str(ctx.exception))
+
+
 GMETRIX_APP_CONFIG = {
     "name": "GMetrix SMSe",
     "enabled": True,

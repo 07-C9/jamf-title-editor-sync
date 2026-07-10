@@ -49,9 +49,8 @@
     "enabled": true,
     "title_id_env_var": "TITLE_EDITOR_GMETRIX_TITLE_ID",
     "version_source": {
-      "type": "html_scrape",
-      "url": "https://www.gmetrix.net/GetGMetrixSMS.aspx",
-      "regex": "GMetrixSMSe-([0-9]+\\.[0-9]+\\.[0-9]+)-universal\\.dmg"
+      "type": "electron_updater_feed",
+      "url": "https://releases.gmetrix.net/smse/latest/mac/latest-mac.yml"
     },
     "version_pattern": "^\\d+\\.\\d+\\.\\d+$",
     "patch_template": {

@@ -92,9 +92,15 @@ The full `apps.json` config entry:
 
 GMetrix SMSe is a testing platform common in K-12 and higher ed. Jamf has no built-in patch definition for it, so there's no version tracking unless you build it yourself.
 
-GMetrix publishes a download page at `https://www.gmetrix.net/GetGMetrixSMS.aspx` with the current DMG filename in the page source (e.g., `GMetrixSMSe-7.1.7-universal.dmg`). The Lambda fetches that page and pulls the version out with a regex.
+GMetrix is an Electron app that updates itself with electron-updater. The updater polls a YAML feed on the vendor's CDN, and the feed's top-level `version:` line is the current release:
 
-The `version_source.type` here is `html_scrape` instead of `google_versionhistory`. This tells the Lambda to treat the response as HTML and apply the `regex` pattern. The regex needs exactly one capture group containing the version string.
+```
+https://releases.gmetrix.net/smse/latest/mac/latest-mac.yml
+```
+
+The `electron_updater_feed` source type fetches that feed and reads the `version:` line; the config doesn't need a regex. Most apps built on electron-updater publish the same kind of feed (a `latest-mac.yml` next to the DMG), so the source type isn't GMetrix-specific.
+
+This app was originally tracked with `html_scrape` against the vendor's download page. That broke in July 2026 when GMetrix relaunched the page as a React app: the DMG filename left the server-rendered HTML, and the version moved behind an API that rejects non-browser clients. The updater feed is the sturdier source. Installed copies of the app poll it, so the vendor can't break it without breaking their own auto-update.
 
 ```json
 {
@@ -102,9 +108,8 @@ The `version_source.type` here is `html_scrape` instead of `google_versionhistor
   "enabled": true,
   "title_id_env_var": "TITLE_EDITOR_GMETRIX_TITLE_ID",
   "version_source": {
-    "type": "html_scrape",
-    "url": "https://www.gmetrix.net/GetGMetrixSMS.aspx",
-    "regex": "GMetrixSMSe-([0-9]+\\.[0-9]+\\.[0-9]+)-universal\\.dmg"
+    "type": "electron_updater_feed",
+    "url": "https://releases.gmetrix.net/smse/latest/mac/latest-mac.yml"
   },
   "version_pattern": "^\\d+\\.\\d+\\.\\d+$",
   "patch_template": {
@@ -206,7 +211,7 @@ The same `github_releases` + EA pattern covers other tools that live outside `/A
 
 ConnectWise ScreenConnect (ConnectWise Control) clients auto-update to match their server, but there's no built-in Jamf definition to track whether that's actually happening. The server exposes its version publicly through `Script.ashx` on the instance URL, no auth required.
 
-The `version_source` uses `html_scrape` to pull `productVersion` from the response. The version tracks your server version, not the latest ConnectWise release, because clients should match whatever server they connect to. When you upgrade the server, the Lambda picks up the new version and flags any clients that haven't updated yet.
+The `version_source` uses `html_scrape` to pull `productVersion` from the response; the `regex` needs exactly one capture group containing the version string. The version tracks your server version, not the latest ConnectWise release, because clients should match whatever server they connect to. When you upgrade the server, the Lambda picks up the new version and flags any clients that haven't updated yet.
 
 The app name includes an instance-specific hash (e.g., `connectwisecontrol-<instance-hash>.app`), so the EA uses a wildcard match with `find` instead of a hardcoded path. It reads `CFBundleVersion` for the full 4-part version since `CFBundleShortVersionString` only reports the major.minor.
 
@@ -488,9 +493,10 @@ terraform apply
 | Type | How it works | Example |
 |------|-------------|---------|
 | `google_versionhistory` | Fetches JSON, reads `releases[0].version` | Chrome VersionHistory API |
-| `html_scrape` | Fetches HTML, applies `regex` capture group to extract version | GMetrix download page |
+| `html_scrape` | Fetches HTML, applies `regex` capture group to extract version | ScreenConnect productVersion page |
 | `github_releases` | Fetches latest GitHub release, reads `tag_name`, strips `v` prefix. Optional `version_parts` truncates to N segments. | MacAdmins Python |
 | `redirect_filename` | Issues the request with redirects disabled, reads the version from the `Location` header's filename via `regex`. Never downloads the body. | Washington Secure Browser geturls redirect |
+| `electron_updater_feed` | Fetches an electron-updater YAML feed, reads the top-level `version:` line | GMetrix latest-mac.yml |
 
 ## Monitoring
 
