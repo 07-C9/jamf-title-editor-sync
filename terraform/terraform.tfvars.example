@@ -10,6 +10,8 @@ title_editor_promethean_screen_share_title_id = "5"
 title_editor_wasecurebrowser_title_id         = "6"
 title_editor_outset_title_id                  = "7"
 title_editor_utiluti_title_id                 = "8"
+title_editor_dymo_connect_title_id            = "9"
+title_editor_drc_insight_title_id             = "10"
 alert_email                   = "you@example.com"
 
 # Optional overrides (uncomment to change defaults):
