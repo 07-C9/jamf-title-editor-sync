@@ -23,7 +23,7 @@ Each app has its own version source URL, version format regex, and patch templat
 EventBridge Scheduler (twice daily)
   |
   v
-Lambda (Python 3.13, ~320 lines)
+Lambda (Python 3.13)
   |
   +--- Vendor version API (per-app, configured in apps.json)
   +--- SSM Parameter Store (fetch Title Editor credentials)
@@ -32,7 +32,11 @@ Lambda (Python 3.13, ~320 lines)
   +--- If versions differ:
          POST /v2/softwaretitles/{id}/patches (add version)
          PUT  /v2/softwaretitles/{id} (set currentVersion)
-  +--- After the app loop: download-URL canary GETs each constructed installer URL
+  +--- After the app loop:
+         download-URL canary GETs each constructed installer URL
+         Jamf Pro drift check (optional): Secrets Manager, Jamf Pro OAuth + patch APIs
+         vendor minimum version check: GET each configured feed
+  +--- SNS publish on failure, CloudWatch metrics either way
 ```
 
 Credentials are stored in AWS SSM Parameter Store (encrypted). Title Editor itself is the state store, so the Lambda is stateless.
@@ -526,6 +530,7 @@ Five CloudWatch alarms, all emailing via SNS:
 - Duration: Execution approaching the 90-second timeout
 - No invocations (24h): Scheduler stopped firing (deleted, misconfigured)
 - Download-URL failure: the canary found a dead installer URL (e.g. an Adobe CC build-path change), reported via the `DownloadUrlCheckFailures` metric
+- Minimum version changed: a vendor moved the lowest version it will still accept, reported via the `MinimumVersionChanged` metric
 
 When a run fails, the Lambda also emails the detail to the same topic before it raises: which apps failed and why, what succeeded, and a link to the logs. The alarm email only says the run broke; the detail email says which app and what error.
 
@@ -549,7 +554,7 @@ An optional sixth alarm watches whether Jamf Pro is actually ingesting what the 
 - Lambda has no function URL, no API Gateway, no public endpoint. Only EventBridge can invoke it.
 - Credentials stored in SSM Parameter Store as SecureStrings, encrypted with the AWS-managed KMS key.
 - Terraform creates SSM params with placeholders. Real values are set via CLI after deploy. `terraform.tfvars` is gitignored.
-- The Lambda IAM role can read its two SSM parameters, write to its own log group, and nothing else.
+- The Lambda IAM role can read its two SSM parameters, write to its own log group, publish metrics into the `JamfPatchSync` namespace, and publish to the alerts topic. When the Jamf Pro drift check is configured it can also read that one Secrets Manager secret. Every grant is scoped to a specific ARN except `PutMetricData`, which has no resource-level permissions and is restricted by namespace instead.
 - Version strings are validated against a regex before any Title Editor API call.
 - The handler never logs credentials or bearer tokens.
 

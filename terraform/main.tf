@@ -69,7 +69,6 @@ resource "aws_ssm_parameter" "te_password" {
 
 # --- IAM: Lambda execution role ---
 
-data "aws_caller_identity" "current" {}
 
 resource "aws_iam_role" "lambda" {
   name        = "${var.project_name}-lambda"
@@ -307,6 +306,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   }
 
   alarm_actions = [aws_sns_topic.alerts.arn]
+  ok_actions    = [aws_sns_topic.alerts.arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "no_invocations" {
@@ -326,12 +326,13 @@ resource "aws_cloudwatch_metric_alarm" "no_invocations" {
   }
 
   alarm_actions = [aws_sns_topic.alerts.arn]
+  ok_actions    = [aws_sns_topic.alerts.arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "jamfpro_definition_lag" {
   count               = var.jamf_pro_url != "" ? 1 : 0
   alarm_name          = "${var.project_name}-jamfpro-definition-lag"
-  alarm_description   = "Jamf Pro's ingested patch definitions have diverged from Title Editor for two consecutive sync runs (roughly 24 hours). Brief lag right after a version push is normal (Jamf Pro polls Title Editor on its own schedule) and will not fire this. Persistent divergence means Jamf Pro stopped pulling from Title Editor: re-save the external patch source under Settings > Computer management > Patch management to force the M2M reconnect, then confirm the next runs post JamfProDefinitionLag=0. Metric comes from the sync Lambda's drift check; the run's 'lagging' log lines name the titles."
+  alarm_description   = "Jamf Pro's ingested patch definitions have diverged from Title Editor for two consecutive sync runs (roughly 24 hours). Brief lag right after a version push is normal (Jamf Pro polls Title Editor on its own schedule) and will not fire this. Persistent divergence means Jamf Pro stopped pulling from Title Editor: re-save the external patch source under Settings > Computer management > Patch management to force the M2M reconnect, then confirm the next runs post JamfProDefinitionLag=0. Metric comes from the sync Lambda's drift check; the run's 'Jamf Pro definition lag' log lines name the titles."
   namespace           = "JamfPatchSync"
   metric_name         = "JamfProDefinitionLag"
   statistic           = "Minimum"
@@ -371,7 +372,7 @@ resource "aws_cloudwatch_metric_alarm" "download_url_failures" {
   evaluation_periods  = 1
   threshold           = 0
   comparison_operator = "GreaterThanThreshold"
-  treat_missing_data  = "notBreaching"
+  treat_missing_data  = "ignore"
 
   alarm_actions = [aws_sns_topic.alerts.arn]
   ok_actions    = [aws_sns_topic.alerts.arn]
