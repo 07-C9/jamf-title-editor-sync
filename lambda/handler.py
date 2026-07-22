@@ -3,6 +3,7 @@
 
 import base64
 import copy
+import http.client
 import http.cookiejar
 import json
 import logging
@@ -36,7 +37,13 @@ def _is_timeout(exc):
 def _is_transient(exc):
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in TRANSIENT_HTTP_STATUSES
-    return isinstance(exc, (TimeoutError, urllib.error.URLError))
+    # urllib only wraps connect-phase failures in URLError. A reset or a
+    # truncated body during the response arrives raw, which is exactly the
+    # shape a flaky CDN produces, so classify those explicitly.
+    return isinstance(
+        exc,
+        (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException),
+    )
 
 
 def _with_retries(label, fn, attempts=2, retry_timeouts=True):
@@ -55,7 +62,27 @@ def _with_retries(label, fn, attempts=2, retry_timeouts=True):
                 time.sleep(RETRY_BACKOFF_SECONDS)
                 continue
             suffix = f" (failed {attempt} attempts)" if attempt > 1 else ""
-            raise RuntimeError(f"{label}: {e}{suffix}") from e
+            # Some exceptions stringify to nothing useful (a malformed status
+            # line is bare CRLF), which left alerts ending at the colon. Fall
+            # back to the type, and keep the text on one line for the email.
+            detail = " ".join(str(e).split()) or type(e).__name__
+            raise RuntimeError(f"{label}: {detail}{suffix}") from e
+
+
+def _publish_metric(name, value, dimensions=None):
+    """Telemetry must never decide a run's outcome. These puts sit between the
+    failures a run collected and the email that reports them, so an unguarded
+    CloudWatch throttle would discard every one of them."""
+    metric = {"MetricName": name, "Value": value, "Unit": "Count"}
+    if dimensions:
+        metric["Dimensions"] = dimensions
+    try:
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="JamfPatchSync", MetricData=[metric]
+        )
+    except Exception as e:
+        logger.error(f"Could not publish {name} metric: {e}")
+
 
 APPS = json.loads((Path(__file__).parent / "apps.json").read_text())
 
@@ -307,14 +334,9 @@ def _update_title(base_url, token, title_id, version, app_config, patch_exists=F
     )
     logger.info(f"Set currentVersion to {version} for {app_config['name']}")
 
-    boto3.client("cloudwatch").put_metric_data(
-        Namespace="JamfPatchSync",
-        MetricData=[{
-            "MetricName": "PatchVersionUpdated",
-            "Dimensions": [{"Name": "AppName", "Value": app_config["name"]}],
-            "Value": 1,
-            "Unit": "Count",
-        }],
+    _publish_metric(
+        "PatchVersionUpdated", 1,
+        dimensions=[{"Name": "AppName", "Value": app_config["name"]}],
     )
 
 
@@ -610,14 +632,7 @@ def lambda_handler(event, context):
         logger.error(failure)
         results.append({"check": "download_url", "status": "failed", "detail": failure})
 
-    boto3.client("cloudwatch").put_metric_data(
-        Namespace="JamfPatchSync",
-        MetricData=[{
-            "MetricName": "DownloadUrlCheckFailures",
-            "Value": len(download_failures),
-            "Unit": "Count",
-        }],
-    )
+    _publish_metric("DownloadUrlCheckFailures", len(download_failures))
 
     if os.environ.get("JAMF_PRO_URL") and os.environ.get("JAMF_PRO_SECRET_ID"):
         try:
@@ -625,14 +640,7 @@ def lambda_handler(event, context):
             for item in drifted:
                 logger.warning(f"Jamf Pro definition lag: {item}")
                 results.append({"check": "jamfpro_drift", "status": "lagging", "detail": item})
-            boto3.client("cloudwatch").put_metric_data(
-                Namespace="JamfPatchSync",
-                MetricData=[{
-                    "MetricName": "JamfProDefinitionLag",
-                    "Value": len(drifted),
-                    "Unit": "Count",
-                }],
-            )
+            _publish_metric("JamfProDefinitionLag", len(drifted))
         except Exception as e:
             logger.error(f"Jamf Pro drift check failed - {e}")
             failures.append("Jamf Pro drift check")
@@ -660,14 +668,7 @@ def lambda_handler(event, context):
     else:
         # Only record a count the check actually established. Publishing 0 after
         # a failed check would clear a standing alarm with a number nobody measured.
-        boto3.client("cloudwatch").put_metric_data(
-            Namespace="JamfPatchSync",
-            MetricData=[{
-                "MetricName": "MinimumVersionChanged",
-                "Value": len(changes),
-                "Unit": "Count",
-            }],
-        )
+        _publish_metric("MinimumVersionChanged", len(changes))
 
     if failures or download_failures:
         _publish_failure_alert(

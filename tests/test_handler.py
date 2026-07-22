@@ -394,6 +394,9 @@ class TestFetchVersionElectronUpdaterFeed(unittest.TestCase):
             self.assertIn("No version found", str(ctx.exception))
 
 
+# A synthetic second app for exercising multi-app handling and html_scrape.
+# It is NOT the shipped GMetrix config, which tracks an electron-updater feed;
+# TestAppsJsonIntegrity is what pins the real entries.
 GMETRIX_APP_CONFIG = {
     "name": "GMetrix SMSe",
     "enabled": True,
@@ -1898,29 +1901,29 @@ class TestRunMinimumVersionChecks(unittest.TestCase):
     def _sb_versions(self, mac_floor):
         return {"SecureClientVersion.Mac": {"minimumVersion": mac_floor, "updateFile": ""}}
 
-    def _known(self, handler):
-        drc = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
-        return drc["minimum_accepted_version"]["known"]
+    KNOWN = "16.0.0"
 
     def test_unchanged_floor_reports_nothing(self):
         handler = _reload_handler()
         with patch("handler.urllib.request.urlopen",
-                   return_value=_make_response(self._sb_versions(self._known(handler)))):
+                   return_value=_make_response(self._sb_versions(self.KNOWN))):
             self.assertEqual(handler._run_minimum_version_checks(), ([], []))
 
     def test_changed_floor_names_both_values(self):
         """The whole point of the check: WIDA moving its number is the moment
         machines that were merely behind become refused."""
         handler = _reload_handler()
-        known = self._known(handler)
         with patch("handler.urllib.request.urlopen",
                    return_value=_make_response(self._sb_versions("17.0.0"))):
             changes, errors = handler._run_minimum_version_checks()
         self.assertEqual(errors, [])
-        self.assertEqual(len(changes), 1)
-        self.assertIn("DRC INSIGHT", changes[0])
-        self.assertIn("17.0.0", changes[0])
-        self.assertIn(known, changes[0])
+        # Pinned whole: asserting both numbers appear separately let a message
+        # that stated them backwards pass, which would send you to update
+        # apps.json to the vendor's old floor.
+        self.assertEqual(changes, [
+            "DRC INSIGHT: vendor minimum accepted version is now 17.0.0 "
+            "(apps.json records 16.0.0)"
+        ])
 
     def test_a_lower_floor_is_still_a_change(self):
         """A vendor relaxing its floor matters too, and a comparison-based
@@ -2076,13 +2079,11 @@ class TestLambdaHandlerMinimumVersionIntegration(unittest.TestCase):
                 with patch("handler.boto3.client", side_effect=self._boto_router()):
                     return self.handler.lambda_handler({}, None)
 
-    def _known(self):
-        drc = next(a for a in self.handler.APPS if a["name"] == "DRC INSIGHT")
-        return drc["minimum_accepted_version"]["known"]
+    KNOWN = "16.0.0"
 
     def test_unchanged_floor_emits_zero(self):
         result = self._run(_make_response(
-            {"SecureClientVersion.Mac": {"minimumVersion": self._known(), "updateFile": ""}}
+            {"SecureClientVersion.Mac": {"minimumVersion": self.KNOWN, "updateFile": ""}}
         ))
         self.assertEqual(result["statusCode"], 200)
         self.assertEqual(self._changed_metric_values(), [0])
@@ -2108,7 +2109,7 @@ class TestLambdaHandlerMinimumVersionIntegration(unittest.TestCase):
         than being current) must not change whether it runs."""
         result = self._run(
             _make_response(
-                {"SecureClientVersion.Mac": {"minimumVersion": self._known(), "updateFile": ""}}
+                {"SecureClientVersion.Mac": {"minimumVersion": self.KNOWN, "updateFile": ""}}
             ),
             te_current="16.0.0",
             update_calls=2,
@@ -2143,6 +2144,291 @@ class TestLambdaHandlerMinimumVersionIntegration(unittest.TestCase):
             {"SecureClientVersion.Mac": {"minimumVersion": "17.0.0", "updateFile": ""}}
         ))
         self.mock_sns.publish.assert_not_called()
+
+
+class TestTransientClassification(unittest.TestCase):
+    """_with_retries documents that it retries connection errors. urllib only
+    wraps failures from the connect phase in URLError; anything raised while
+    reading the response arrives raw, so these have to be classified explicitly
+    or a mid-response reset fails an app for the whole 12-hour cycle."""
+
+    def _connection_level_errors(self):
+        import http.client
+        return [
+            ConnectionResetError(54, "Connection reset by peer"),
+            http.client.RemoteDisconnected("Remote end closed connection"),
+            http.client.IncompleteRead(b"12345", 95),
+            http.client.BadStatusLine("\r\n"),
+        ]
+
+    def test_connection_level_failures_are_transient(self):
+        handler = _reload_handler()
+        for exc in self._connection_level_errors():
+            self.assertTrue(
+                handler._is_transient(exc),
+                f"{type(exc).__name__} should be retryable",
+            )
+
+    def test_connection_level_failures_are_actually_retried(self):
+        handler = _reload_handler()
+        for exc in self._connection_level_errors():
+            calls = []
+
+            def fn():
+                calls.append(1)
+                raise exc
+
+            with patch("time.sleep"):
+                with self.assertRaises(RuntimeError):
+                    handler._with_retries("GET https://vendor.test/feed", fn)
+            self.assertEqual(len(calls), 2, f"{type(exc).__name__} was not retried")
+
+    def test_a_404_is_still_not_retried(self):
+        handler = _reload_handler()
+        calls = []
+
+        def fn():
+            calls.append(1)
+            raise urllib.error.HTTPError("https://x", 404, "Not Found", {}, None)
+
+        with self.assertRaises(RuntimeError):
+            handler._with_retries("GET https://x", fn)
+        self.assertEqual(len(calls), 1)
+
+
+class TestRetryErrorMessage(unittest.TestCase):
+
+    def test_blank_exception_text_still_names_the_failure(self):
+        """A malformed status line stringifies to bare CRLF, which produced
+        alert lines ending in 'GET <url>: ' with nothing after the colon."""
+        import http.client
+        handler = _reload_handler()
+
+        def fn():
+            raise http.client.BadStatusLine("\r\n")
+
+        with patch("time.sleep"):
+            with self.assertRaises(RuntimeError) as ctx:
+                handler._with_retries("version source GET https://vendor.test/x", fn)
+        message = str(ctx.exception)
+        self.assertIn("version source GET https://vendor.test/x", message)
+        self.assertIn("BadStatusLine", message)
+        self.assertNotIn("\r", message)
+        self.assertNotIn("\n", message)
+
+
+class TestMetricFailuresDoNotMaskResults(unittest.TestCase):
+    """The metric puts sit between the collected failures and the detail email.
+    Unguarded, a CloudWatch throttle throws away every failure the run found."""
+
+    def setUp(self):
+        self.handler = _reload_handler()
+        self._apps = self.handler.APPS
+        self.handler.APPS = [a for a in self.handler.APPS if a["name"] == "Google Chrome"]
+        self.addCleanup(setattr, self.handler, "APPS", self._apps)
+        os.environ["ALERT_TOPIC_ARN"] = "arn:aws:sns:us-west-2:111122223333:test-alerts"
+        self.addCleanup(os.environ.pop, "ALERT_TOPIC_ARN", None)
+        os.environ.pop("JAMF_PRO_URL", None)
+        os.environ.pop("JAMF_PRO_SECRET_ID", None)
+        self.mock_sns = MagicMock()
+        self.cloudwatch = MagicMock()
+        self.cloudwatch.put_metric_data.side_effect = RuntimeError("ThrottlingException")
+        self.mock_ssm = MagicMock()
+        self.mock_ssm.get_parameter.side_effect = [
+            {"Parameter": {"Value": "u"}}, {"Parameter": {"Value": "p"}},
+        ]
+
+    def _router(self):
+        def route(svc):
+            return {"ssm": self.mock_ssm, "cloudwatch": self.cloudwatch,
+                    "sns": self.mock_sns}.get(svc, MagicMock())
+        return route
+
+    def test_throttled_metric_still_lets_the_failure_email_out(self):
+        _disable_download_checks(self)
+        responses = [
+            _make_response({"token": "t"}),
+            urllib.error.HTTPError("https://x", 500, "boom", {}, None),
+        ]
+        with patch("time.sleep"):
+            with patch("handler.urllib.request.urlopen", side_effect=responses * 3):
+                with patch("handler.boto3.client", side_effect=self._router()):
+                    with self.assertRaises(RuntimeError):
+                        self.handler.lambda_handler({}, None)
+        self.mock_sns.publish.assert_called_once()
+        self.assertIn("Google Chrome", self.mock_sns.publish.call_args.kwargs["Message"])
+
+
+class TestUpdateMetricFailureDoesNotFailThePublish(unittest.TestCase):
+
+    def test_publish_succeeds_even_if_the_metric_put_throws(self):
+        """Both Title Editor writes have already landed by then; reporting the
+        app as failed would raise a false alarm for a patch that published."""
+        handler = _reload_handler()
+        app_config = next(a for a in handler.APPS if a["name"] == "Google Chrome")
+        cloudwatch = MagicMock()
+        cloudwatch.put_metric_data.side_effect = RuntimeError("AccessDenied")
+        with patch("handler._title_editor_request") as te:
+            with patch("handler.boto3.client", return_value=cloudwatch):
+                handler._update_title(
+                    "https://te.test", "tok", "1", "150.0.0.1", app_config, False
+                )
+        methods = [c.args[2] for c in te.call_args_list]
+        self.assertIn("POST", methods)
+        self.assertIn("PUT", methods)
+
+
+class TestTitleEditorWireFormat(unittest.TestCase):
+    """Publishing a patch is the product. Nothing else asserted the method,
+    path, headers or body that actually reach Title Editor, so a wrong path or
+    a dropped field would have shipped green."""
+
+    def _capture(self, fn):
+        sent = []
+
+        def urlopen(req, timeout=None):
+            sent.append({
+                "method": req.get_method(),
+                "url": req.full_url,
+                "auth": req.get_header("Authorization"),
+                "content_type": req.get_header("Content-type"),
+                "body": json.loads(req.data.decode()) if req.data else None,
+            })
+            return _make_response({})
+
+        with patch("handler.urllib.request.urlopen", side_effect=urlopen):
+            fn()
+        return sent
+
+    def test_update_posts_the_patch_then_sets_current_version(self):
+        handler = _reload_handler()
+        app_config = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+        sent = self._capture(lambda: handler._update_title(
+            "https://te.test", "tok-123", "11", "17.1.0", app_config, False
+        ))
+        self.assertEqual(len(sent), 2)
+
+        post, put = sent
+        self.assertEqual(post["method"], "POST")
+        self.assertEqual(post["url"], "https://te.test/v2/softwaretitles/11/patches")
+        self.assertEqual(post["body"]["version"], "17.1.0")
+        self.assertEqual(post["body"]["components"][0]["version"], "17.1.0")
+
+        self.assertEqual(put["method"], "PUT")
+        self.assertEqual(put["url"], "https://te.test/v2/softwaretitles/11")
+        self.assertEqual(put["body"], {"currentVersion": "17.1.0", "enabled": True})
+
+    def test_existing_patch_version_is_not_posted_again(self):
+        handler = _reload_handler()
+        app_config = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+        sent = self._capture(lambda: handler._update_title(
+            "https://te.test", "tok-123", "11", "17.1.0", app_config, True
+        ))
+        self.assertEqual([s["method"] for s in sent], ["PUT"])
+        self.assertEqual(sent[0]["body"], {"currentVersion": "17.1.0", "enabled": True})
+
+    def test_requests_carry_the_bearer_token_and_json_content_type(self):
+        handler = _reload_handler()
+        sent = self._capture(lambda: handler._title_editor_request(
+            "https://te.test", "tok-123", "POST", "/v2/softwaretitles/11/patches",
+            {"version": "17.1.0"},
+        ))
+        self.assertEqual(sent[0]["auth"], "Bearer tok-123")
+        self.assertEqual(sent[0]["content_type"], "application/json")
+        self.assertEqual(sent[0]["body"], {"version": "17.1.0"})
+
+    def test_title_info_reads_the_requested_title(self):
+        handler = _reload_handler()
+        sent = self._capture(
+            lambda: handler._get_title_info("https://te.test", "tok-123", "11")
+        )
+        self.assertEqual(sent[0]["method"], "GET")
+        self.assertEqual(sent[0]["url"], "https://te.test/v2/softwaretitles/11")
+
+
+class TestVersionFeedOrdering(unittest.TestCase):
+
+    def test_chrome_feed_takes_the_newest_release_not_the_oldest(self):
+        """Google's feed is newest-first and carries the whole history. Reading
+        the wrong end still yields a valid four-part string, so version_pattern
+        would not catch it and a stale Chrome would publish silently."""
+        handler = _reload_handler()
+        app_config = next(a for a in handler.APPS if a["name"] == "Google Chrome")
+        feed = {"releases": [
+            {"version": "150.0.7871.190"},
+            {"version": "150.0.7871.182"},
+            {"version": "149.0.7827.54"},
+        ]}
+        with patch("handler.urllib.request.urlopen", return_value=_make_response(feed)):
+            self.assertEqual(handler._fetch_latest_version(app_config), "150.0.7871.190")
+
+
+class TestAppsJsonIntegrity(unittest.TestCase):
+    """The shipped config is what reaches production. Several entries were only
+    ever exercised through hand-written fixtures, one of which had already
+    drifted from the real file."""
+
+    EXPECTED_SOURCE_TYPES = {
+        "Google Chrome": "google_versionhistory",
+        "GMetrix SMSe": "electron_updater_feed",
+        "MacAdmins Python": "github_releases",
+        "ScreenConnect Client": "html_scrape",
+        "Promethean Screen Share": "html_scrape",
+        "Washington Secure Browser": "redirect_filename",
+        "Outset": "github_releases",
+        "utiluti": "github_releases",
+        "DYMO Connect": "html_scrape",
+        "DRC INSIGHT": "html_scrape",
+    }
+
+    def test_every_app_uses_the_expected_source_type(self):
+        handler = _reload_handler()
+        actual = {a["name"]: a["version_source"]["type"] for a in handler.APPS}
+        self.assertEqual(actual, self.EXPECTED_SOURCE_TYPES)
+
+    def test_every_source_type_is_one_the_handler_dispatches(self):
+        handler = _reload_handler()
+        known = {"google_versionhistory", "html_scrape", "github_releases",
+                 "redirect_filename", "electron_updater_feed"}
+        for app in handler.APPS:
+            self.assertIn(app["version_source"]["type"], known, app["name"])
+
+    def test_every_app_declares_enabled_and_a_title_id_env_var(self):
+        """Both loops fall back to enabled=True when the key is absent, so an
+        entry added without it would be silently included or skipped."""
+        handler = _reload_handler()
+        for app in handler.APPS:
+            self.assertIn("enabled", app, app["name"])
+            self.assertIn("title_id_env_var", app, app["name"])
+
+    def test_every_version_pattern_is_anchored(self):
+        handler = _reload_handler()
+        for app in handler.APPS:
+            pattern = app["version_pattern"]
+            self.assertTrue(pattern.startswith("^"), app["name"])
+            self.assertTrue(pattern.endswith("$"), app["name"])
+
+    def test_every_criteria_operator_is_an_equality_match(self):
+        """An operator flipped to 'is not' inverts what the patch matches."""
+        handler = _reload_handler()
+        for app in handler.APPS:
+            for component in app["patch_template"]["components"]:
+                for criterion in component["criteria"]:
+                    self.assertEqual(criterion["operator"], "is", app["name"])
+
+    def test_drc_insight_pins_its_operating_system_floor(self):
+        handler = _reload_handler()
+        drc = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+        self.assertEqual(drc["patch_template"]["minimumOperatingSystem"], "14.6")
+        self.assertEqual(drc["patch_template"]["capabilities"][0]["value"], "14.6")
+        self.assertEqual(drc["version_pattern"], r"^\d+\.\d+\.\d+$")
+
+    def test_drc_insight_records_the_wida_floor_we_have_acknowledged(self):
+        """Pinned as a literal so the floor-change tests cannot pass by reading
+        this value back out of the file they are meant to be checking."""
+        handler = _reload_handler()
+        drc = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+        self.assertEqual(drc["minimum_accepted_version"]["known"], "16.0.0")
 
 
 if __name__ == "__main__":
