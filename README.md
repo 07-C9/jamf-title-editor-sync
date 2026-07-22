@@ -323,23 +323,6 @@ This is deliberately a health check, not a patch title. Adobe's ESD build number
 
 A failure emits the `DownloadUrlCheckFailures` metric and raises at the end of the run, so both the `Errors` alarm and the dedicated download-URL alarm email you (see [Monitoring](#monitoring)).
 
-## Version published notices
-
-A successful sync is otherwise silent, so a new version landing is only visible by going and looking at Jamf Pro. When a run publishes at least one version, it emails the same SNS topic the alarms use, naming every app it pushed and both versions:
-
-```
-Subject: jamf-title-editor-sync published: Google Chrome 150.0.7871.190
-
-jamf-title-editor-sync published 1 new version to Title Editor.
-Jamf Pro ingests it on its own schedule, usually within about 30 minutes.
-
-  - Google Chrome: 150.0.7871.182 -> 150.0.7871.190
-```
-
-One email per run, not per app, so several apps updating at once stay a single message. Runs where nothing changed send nothing, which is most of them.
-
-This is deliberately a direct notification rather than a CloudWatch alarm on the `PatchVersionUpdated` metric. The Lambda already knows what it pushed, so it can name the app and both versions; an alarm email would only report that a threshold was crossed and leave you to work out which app. Nothing is queried to build it.
-
 ## Vendor minimum version check
 
 Patch reporting answers "how many machines are behind the newest release". For software that has to talk to a vendor's service, there is a second number the vendor controls: the lowest version it will still accept. That number moves on the vendor's schedule and changes nothing on disk, so no patch report can show it moving.
@@ -544,7 +527,7 @@ Five CloudWatch alarms, all emailing via SNS:
 - No invocations (24h): Scheduler stopped firing (deleted, misconfigured)
 - Download-URL failure: the canary found a dead installer URL (e.g. an Adobe CC build-path change), reported via the `DownloadUrlCheckFailures` metric
 
-The Lambda emails the same topic when a run publishes a new version (see [Version published notices](#version-published-notices)). When a run fails, it also emails the detail before it raises: which apps failed and why, what succeeded, and a link to the logs. The alarm email only says the run broke; the detail email says which app and what error.
+When a run fails, the Lambda also emails the detail to the same topic before it raises: which apps failed and why, what succeeded, and a link to the logs. The alarm email only says the run broke; the detail email says which app and what error.
 
 The Errors and Duration alarms ignore missing data because the function only runs twice a day. Once one fires it stays in ALARM until a later run posts a clean datapoint, so an OK email means a later run came back clean. Async retries are off; retrying a broken version source a minute later fails the same way, so a failed run just waits for the next scheduled one.
 

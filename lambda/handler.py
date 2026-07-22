@@ -489,71 +489,14 @@ def _run_minimum_version_checks():
     return changes, errors
 
 
-def _function_name():
-    return os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "jamf-title-editor-sync")
-
-
-def _log_url():
-    region = os.environ.get("AWS_REGION", "us-west-2")
-    log_group = os.environ.get(
-        "AWS_LAMBDA_LOG_GROUP_NAME", f"/aws/lambda/{_function_name()}"
-    )
-    return (
-        f"https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}"
-        f"#logsV2:log-groups/log-group/{log_group.replace('/', '$252F')}"
-    )
-
-
-def _sns_subject(text):
-    """SNS rejects subjects over 100 characters."""
-    return text if len(text) <= 100 else text[:97] + "..."
-
-
-def _build_update_notice(results, request_id):
-    """Says exactly which versions this run published. The Lambda already knows
-    what it pushed, so the notice names the app and both versions rather than
-    leaving a metric threshold to be interpreted."""
-    updated = [r for r in results if r.get("status") == "updated"]
-    function_name = _function_name()
-    noun = "version" if len(updated) == 1 else "versions"
-
-    if len(updated) == 1:
-        subject = f"{function_name} published: {updated[0]['app']} {updated[0]['to']}"
-    else:
-        subject = f"{function_name} published {len(updated)} new {noun}"
-
-    lines = [
-        f"{function_name} published {len(updated)} new {noun} to Title Editor.",
-        f"Jamf Pro ingests {'it' if len(updated) == 1 else 'them'} on its own "
-        f"schedule, usually within about 30 minutes.",
-        "",
-    ]
-    for r in updated:
-        lines.append(f"  - {r['app']}: {r['from']} -> {r['to']}")
-    lines += ["", f"Request ID: {request_id}", f"Logs: {_log_url()}"]
-    return _sns_subject(subject), "\n".join(lines)
-
-
-def _publish_update_notice(results, request_id):
-    topic_arn = os.environ.get("ALERT_TOPIC_ARN")
-    if not topic_arn:
-        return
-    if not any(r.get("status") == "updated" for r in results):
-        return
-    subject, body = _build_update_notice(results, request_id)
-    try:
-        boto3.client("sns").publish(TopicArn=topic_arn, Subject=subject, Message=body)
-    except Exception as e:
-        # A successful sync must not be failed by a notification problem.
-        logger.error(f"Could not publish update notice to SNS: {e}")
-
-
 def _build_failure_alert(results, failures, download_failures, request_id):
-    function_name = _function_name()
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "jamf-title-editor-sync")
+    region = os.environ.get("AWS_REGION", "us-west-2")
+    log_group = os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME", f"/aws/lambda/{function_name}")
 
-    subject = _sns_subject(
-        f"{function_name} FAILED: {', '.join(failures) or 'download URL checks'}"
-    )
+    subject = f"{function_name} FAILED: {', '.join(failures) or 'download URL checks'}"
+    if len(subject) > 100:
+        subject = subject[:97] + "..."
 
     changed = [r for r in results if r.get("status") == "changed"]
     if changed:
@@ -596,7 +539,11 @@ def _build_failure_alert(results, failures, download_failures, request_id):
             lines.append(f"  - {r['app']}: current at {r['version']}")
         else:
             lines.append(f"  - {r['app']}: updated {r['from']} -> {r['to']}")
-    lines += ["", f"Request ID: {request_id}", f"Logs: {_log_url()}"]
+    log_url = (
+        f"https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}"
+        f"#logsV2:log-groups/log-group/{log_group.replace('/', '$252F')}"
+    )
+    lines += ["", f"Request ID: {request_id}", f"Logs: {log_url}"]
     return subject, "\n".join(lines)
 
 
@@ -721,8 +668,6 @@ def lambda_handler(event, context):
                 "Unit": "Count",
             }],
         )
-
-    _publish_update_notice(results, getattr(context, "aws_request_id", "unknown"))
 
     if failures or download_failures:
         _publish_failure_alert(
