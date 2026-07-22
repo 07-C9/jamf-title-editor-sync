@@ -174,6 +174,8 @@ resource "aws_lambda_function" "patch_sync" {
       TITLE_EDITOR_WASECUREBROWSER_TITLE_ID         = var.title_editor_wasecurebrowser_title_id
       TITLE_EDITOR_OUTSET_TITLE_ID                  = var.title_editor_outset_title_id
       TITLE_EDITOR_UTILUTI_TITLE_ID                 = var.title_editor_utiluti_title_id
+      TITLE_EDITOR_DYMO_CONNECT_TITLE_ID            = var.title_editor_dymo_connect_title_id
+      TITLE_EDITOR_DRC_INSIGHT_TITLE_ID             = var.title_editor_drc_insight_title_id
       SSM_USERNAME_PATH                             = aws_ssm_parameter.te_username.name
       SSM_PASSWORD_PATH                             = aws_ssm_parameter.te_password.name
       ALERT_TOPIC_ARN                               = aws_sns_topic.alerts.arn
@@ -335,6 +337,22 @@ resource "aws_cloudwatch_metric_alarm" "jamfpro_definition_lag" {
   statistic           = "Minimum"
   period              = 43200
   evaluation_periods  = 2
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "ignore"
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+  ok_actions    = [aws_sns_topic.alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "minimum_version_changed" {
+  alarm_name          = "${var.project_name}-minimum-version-changed"
+  alarm_description   = "A vendor changed the lowest version it will still accept, and the live value no longer matches the one recorded in lambda/apps.json. Nothing on any Mac changed: what changed is whether machines behind the newest release are merely out of date or now refused outright. For DRC INSIGHT the number comes from WIDA's public sb-versions feed, and a raised floor means students on an older build cannot start an ACCESS test. Patch reporting cannot show this, because it only ever compares against the newest release. Confirm the new number, make sure the required version is deployed ahead of the testing window, then update the 'known' value in lambda/apps.json and redeploy to acknowledge it. The sync Lambda's 'Vendor minimum version changed' log lines name the app, the live value and the recorded value. Missing data holds the current state rather than clearing it, because the metric is only published when the check actually answered."
+  namespace           = "JamfPatchSync"
+  metric_name         = "MinimumVersionChanged"
+  statistic           = "Maximum"
+  period              = 43200
+  evaluation_periods  = 1
   threshold           = 0
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "ignore"

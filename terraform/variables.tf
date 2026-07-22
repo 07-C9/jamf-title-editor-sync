@@ -46,6 +46,16 @@ variable "title_editor_utiluti_title_id" {
   type        = string
 }
 
+variable "title_editor_dymo_connect_title_id" {
+  description = "Numeric ID of the DYMO Connect software title in Title Editor"
+  type        = string
+}
+
+variable "title_editor_drc_insight_title_id" {
+  description = "Numeric ID of the DRC INSIGHT software title in Title Editor"
+  type        = string
+}
+
 variable "alert_email" {
   description = "Email address for failure notifications"
   type        = string

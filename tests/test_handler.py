@@ -7,6 +7,7 @@ import os
 import sys
 import types
 import unittest
+import urllib.error
 from unittest.mock import MagicMock, patch, call
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda"))
@@ -1170,6 +1171,72 @@ class TestUtilutiPatchBody(unittest.TestCase):
         self.assertIn("releaseDate", body)
 
 
+class TestFetchVersionDymoConnect(unittest.TestCase):
+
+    def _dymo_config(self, handler):
+        return next(a for a in handler.APPS if a["name"] == "DYMO Connect")
+
+    def test_valid_version_from_updates_xml(self):
+        handler = _reload_handler()
+        app_config = self._dymo_config(handler)
+        updates_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<Updates>\n\t<DYMOConnect>\n"
+            "\t\t<ProductName>DYMO Connect</ProductName>\n"
+            "\t\t<UpdateName>DYMO Connect v1.6.0.41</UpdateName>\n"
+            "\t\t<Version>1.6.0.41</Version>\n"
+            "\t\t<DownloadURL>https://dymoreleasecontent.blob.core.windows.net/"
+            "dymo-release/DCDMAC/DCDMac1.6.0.41.pkg</DownloadURL>\n"
+            "\t</DYMOConnect>\n</Updates>"
+        )
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = _make_response(updates_xml, raw=True)
+        with patch("handler.urllib.request.build_opener", return_value=mock_opener):
+            version = handler._fetch_latest_version(app_config)
+            self.assertEqual(version, "1.6.0.41")
+
+    def test_updates_xml_no_version_raises(self):
+        handler = _reload_handler()
+        app_config = self._dymo_config(handler)
+        updates_xml = (
+            "<Updates>\n\t<DYMOConnect>\n"
+            "\t\t<ProductName>DYMO Connect</ProductName>\n"
+            "\t</DYMOConnect>\n</Updates>"
+        )
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = _make_response(updates_xml, raw=True)
+        with patch("handler.urllib.request.build_opener", return_value=mock_opener):
+            with self.assertRaises(ValueError) as ctx:
+                handler._fetch_latest_version(app_config)
+            self.assertIn("No version found", str(ctx.exception))
+
+
+class TestDymoConnectPatchBody(unittest.TestCase):
+
+    def _dymo_config(self, handler):
+        return next(a for a in handler.APPS if a["name"] == "DYMO Connect")
+
+    def test_dymo_version_substitution(self):
+        handler = _reload_handler()
+        app_config = self._dymo_config(handler)
+        body = handler._build_patch_body("1.6.0.41", app_config)
+        self.assertEqual(body["version"], "1.6.0.41")
+        self.assertEqual(body["components"][0]["version"], "1.6.0.41")
+        criteria = body["components"][0]["criteria"]
+        criteria_values = [c["value"] for c in criteria]
+        self.assertIn("1.6.0.41", criteria_values)
+        self.assertIn("com.dymo.dymo-connect", criteria_values)
+        self.assertEqual({c["type"] for c in criteria}, {"recon"})
+        self.assertIn("releaseDate", body)
+
+    def test_dymo_template_not_mutated(self):
+        handler = _reload_handler()
+        app_config = self._dymo_config(handler)
+        original = json.dumps(app_config["patch_template"])
+        handler._build_patch_body("1.6.0.41", app_config)
+        self.assertEqual(json.dumps(app_config["patch_template"]), original)
+
+
 class TestBuildFailureAlert(unittest.TestCase):
 
     def test_subject_and_body_carry_failure_detail(self):
@@ -1673,6 +1740,409 @@ class TestTitleEditorAuth(unittest.TestCase):
         import base64
         decoded = base64.b64decode(auth_header.split(" ")[1]).decode()
         self.assertEqual(decoded, "myuser:mypass")
+
+
+class TestFetchVersionDrcInsight(unittest.TestCase):
+
+    def _drc_config(self, handler):
+        return next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+
+    def _lookup_body(self, version="17.0.0", minimum_os="15.7"):
+        return (
+            '{\n "resultCount":1,\n"results": [\n'
+            '{"screenshotUrls":[], "artistViewUrl":"https://apps.apple.com/us/developer/x",'
+            '"trackCensoredName":"DRC INSIGHT", "trackViewUrl":"https://apps.apple.com/us/app/x",'
+            f'"minimumOsVersion":"{minimum_os}", "bundleId":"com.drc.wbte-ipad.drc",'
+            '"currentVersionReleaseDate":"2026-06-25T17:53:38Z",'
+            f'"version":"{version}", "sellerName":"Data Recognition Corporation",'
+            '"trackName":"DRC INSIGHT", "kind":"software"}]\n}'
+        )
+
+    def test_valid_version_from_itunes_lookup(self):
+        handler = _reload_handler()
+        app_config = self._drc_config(handler)
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = _make_response(self._lookup_body(), raw=True)
+        with patch("handler.urllib.request.build_opener", return_value=mock_opener):
+            version = handler._fetch_latest_version(app_config)
+            self.assertEqual(version, "17.0.0")
+
+    def test_three_part_minimum_os_version_is_not_matched(self):
+        """The leading quote and lowercase v anchor the match to the version
+        field; a three-part minimumOsVersion must not be picked up instead."""
+        handler = _reload_handler()
+        app_config = self._drc_config(handler)
+        body = self._lookup_body(version="17.0.0", minimum_os="15.7.1")
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = _make_response(body, raw=True)
+        with patch("handler.urllib.request.build_opener", return_value=mock_opener):
+            self.assertEqual(handler._fetch_latest_version(app_config), "17.0.0")
+
+    def test_lookup_without_version_raises(self):
+        handler = _reload_handler()
+        app_config = self._drc_config(handler)
+        body = '{"resultCount":0, "results": []}'
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = _make_response(body, raw=True)
+        with patch("handler.urllib.request.build_opener", return_value=mock_opener):
+            with self.assertRaises(ValueError) as ctx:
+                handler._fetch_latest_version(app_config)
+            self.assertIn("No version found", str(ctx.exception))
+
+    def test_four_part_version_refused_not_truncated(self):
+        """DRC ships major.minor.patch. If they ever go four-part, the trailing
+        quote in the regex means no match at all, so the run fails loudly
+        instead of silently truncating 17.0.0.1 to 17.0.0 and publishing a
+        patch for a version that was never released."""
+        handler = _reload_handler()
+        app_config = self._drc_config(handler)
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = _make_response(
+            self._lookup_body(version="17.0.0.1"), raw=True
+        )
+        with patch("handler.urllib.request.build_opener", return_value=mock_opener):
+            with self.assertRaises(ValueError) as ctx:
+                handler._fetch_latest_version(app_config)
+            self.assertIn("No version found", str(ctx.exception))
+
+
+class TestDrcInsightPatchBody(unittest.TestCase):
+
+    def _drc_config(self, handler):
+        return next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+
+    def test_version_substitution_uses_recon_criteria(self):
+        handler = _reload_handler()
+        app_config = self._drc_config(handler)
+        body = handler._build_patch_body("17.0.0", app_config)
+        self.assertEqual(body["version"], "17.0.0")
+        self.assertEqual(body["components"][0]["version"], "17.0.0")
+        criteria = body["components"][0]["criteria"]
+        criteria_values = [c["value"] for c in criteria]
+        self.assertIn("17.0.0", criteria_values)
+        self.assertIn("com.datarecognitioncorp.drcinsight.mac.sqa", criteria_values)
+        self.assertEqual({c["type"] for c in criteria}, {"recon"})
+        self.assertIn("releaseDate", body)
+
+    def test_kill_apps_stays_empty(self):
+        """DRC INSIGHT is a locked-down exam browser; a patch policy that quits
+        it could end a student's ACCESS test."""
+        handler = _reload_handler()
+        app_config = self._drc_config(handler)
+        body = handler._build_patch_body("17.0.0", app_config)
+        self.assertEqual(body["killApps"], [])
+
+    def test_template_not_mutated(self):
+        handler = _reload_handler()
+        app_config = self._drc_config(handler)
+        original = json.dumps(app_config["patch_template"])
+        handler._build_patch_body("17.0.0", app_config)
+        self.assertEqual(json.dumps(app_config["patch_template"]), original)
+
+
+class TestFetchMinimumAcceptedVersion(unittest.TestCase):
+
+    SB_VERSIONS = {
+        "SecureClientVersion.Windows64": {"minimumVersion": "16.0.0", "updateFile": ""},
+        "SecureClientVersion.Mac": {"minimumVersion": "16.0.0", "updateFile": ""},
+        "SecureClientVersion.ChromeOS": {"minimumVersion": "16.0.0", "updateFile": ""},
+    }
+
+    def test_walks_json_path_to_the_platform_floor(self):
+        handler = _reload_handler()
+        config = {
+            "url": "https://example.test/sb-versions",
+            "json_path": ["SecureClientVersion.Mac", "minimumVersion"],
+        }
+        with patch("handler.urllib.request.urlopen",
+                   return_value=_make_response(self.SB_VERSIONS)):
+            self.assertEqual(
+                handler._fetch_minimum_accepted_version(config, "DRC INSIGHT"), "16.0.0"
+            )
+
+    def test_unparseable_floor_names_the_app_and_the_value(self):
+        """A vendor feed can hand back an empty or non-numeric version (this
+        endpoint already returns "" for its sibling updateFile field). The
+        failure has to name what broke, not surface a bare int() error."""
+        handler = _reload_handler()
+        config = {
+            "url": "https://example.test/sb-versions",
+            "json_path": ["SecureClientVersion.Mac", "minimumVersion"],
+        }
+        for bad in ("16.0.0-beta", "sixteen", ""):
+            payload = {"SecureClientVersion.Mac": {"minimumVersion": bad}}
+            with patch("handler.urllib.request.urlopen",
+                       return_value=_make_response(payload)):
+                with self.assertRaises(ValueError) as ctx:
+                    handler._fetch_minimum_accepted_version(config, "DRC INSIGHT")
+            message = str(ctx.exception)
+            self.assertIn("DRC INSIGHT", message)
+            self.assertIn(repr(bad), message)
+            self.assertIn("sb-versions", message)
+
+    def test_missing_platform_key_raises(self):
+        handler = _reload_handler()
+        config = {
+            "url": "https://example.test/sb-versions",
+            "json_path": ["SecureClientVersion.Solaris", "minimumVersion"],
+        }
+        with patch("handler.urllib.request.urlopen",
+                   return_value=_make_response(self.SB_VERSIONS)):
+            with self.assertRaises(ValueError) as ctx:
+                handler._fetch_minimum_accepted_version(config, "DRC INSIGHT")
+            self.assertIn("SecureClientVersion.Solaris", str(ctx.exception))
+
+
+class TestRunMinimumVersionChecks(unittest.TestCase):
+
+    def _sb_versions(self, mac_floor):
+        return {"SecureClientVersion.Mac": {"minimumVersion": mac_floor, "updateFile": ""}}
+
+    def _known(self, handler):
+        drc = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+        return drc["minimum_accepted_version"]["known"]
+
+    def test_unchanged_floor_reports_nothing(self):
+        handler = _reload_handler()
+        with patch("handler.urllib.request.urlopen",
+                   return_value=_make_response(self._sb_versions(self._known(handler)))):
+            self.assertEqual(handler._run_minimum_version_checks(), ([], []))
+
+    def test_changed_floor_names_both_values(self):
+        """The whole point of the check: WIDA moving its number is the moment
+        machines that were merely behind become refused."""
+        handler = _reload_handler()
+        known = self._known(handler)
+        with patch("handler.urllib.request.urlopen",
+                   return_value=_make_response(self._sb_versions("17.0.0"))):
+            changes, errors = handler._run_minimum_version_checks()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(changes), 1)
+        self.assertIn("DRC INSIGHT", changes[0])
+        self.assertIn("17.0.0", changes[0])
+        self.assertIn(known, changes[0])
+
+    def test_a_lower_floor_is_still_a_change(self):
+        """A vendor relaxing its floor matters too, and a comparison-based
+        check would have missed it entirely."""
+        handler = _reload_handler()
+        with patch("handler.urllib.request.urlopen",
+                   return_value=_make_response(self._sb_versions("15.0.0"))):
+            changes, errors = handler._run_minimum_version_checks()
+        self.assertEqual(len(changes), 1)
+        self.assertIn("15.0.0", changes[0])
+
+    def test_apps_without_a_declared_floor_are_skipped(self):
+        handler = _reload_handler()
+        handler.APPS = [a for a in handler.APPS if a["name"] == "Google Chrome"]
+        with patch("handler.urllib.request.urlopen") as mock_urlopen:
+            self.assertEqual(handler._run_minimum_version_checks(), ([], []))
+        mock_urlopen.assert_not_called()
+
+    def test_one_unreachable_feed_does_not_hide_another_app_change(self):
+        """A dead feed for one app must not discard a real change already
+        found for another."""
+        handler = _reload_handler()
+        drc = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+        broken = json.loads(json.dumps(drc))
+        broken["name"] = "Broken Vendor"
+        broken["minimum_accepted_version"]["url"] = "https://broken.test/feed"
+        handler.APPS = [broken, drc]
+
+        def route(req, *a, **kw):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "broken.test" in url:
+                raise urllib.error.URLError("connection refused")
+            return _make_response(self._sb_versions("17.0.0"))
+
+        with patch("time.sleep"):
+            with patch("handler.urllib.request.urlopen", side_effect=route):
+                changes, errors = handler._run_minimum_version_checks()
+        self.assertEqual(len(errors), 1)
+        self.assertIn("broken.test", errors[0])
+        self.assertEqual(len(changes), 1)
+        self.assertIn("DRC INSIGHT", changes[0])
+
+    def test_missing_known_value_is_reported_as_an_error(self):
+        handler = _reload_handler()
+        drc = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+        del drc["minimum_accepted_version"]["known"]
+        handler.APPS = [drc]
+        with patch("handler.urllib.request.urlopen") as mock_urlopen:
+            changes, errors = handler._run_minimum_version_checks()
+        self.assertEqual(changes, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("DRC INSIGHT", errors[0])
+        mock_urlopen.assert_not_called()
+
+
+class TestFailureAlertMinimumVersion(unittest.TestCase):
+
+    def _results_with_change(self):
+        return [
+            {"app": "Google Chrome", "status": "failed", "error": "boom"},
+            {"app": "DRC INSIGHT", "status": "current", "version": "17.0.0"},
+            {"check": "minimum_version", "status": "changed",
+             "detail": "DRC INSIGHT: vendor minimum accepted version is now 17.0.0 "
+                       "(apps.json records 16.0.0)"},
+        ]
+
+    def test_change_appears_even_when_another_item_failed(self):
+        """Without this the email lists DRC INSIGHT as current and says nothing
+        else, hiding that the vendor just moved the bar."""
+        handler = _reload_handler()
+        _, body = handler._build_failure_alert(
+            self._results_with_change(), ["Google Chrome"], [], "req-1"
+        )
+        self.assertIn("minimum accepted version is now 17.0.0", body)
+        self.assertIn("apps.json records 16.0.0", body)
+
+    def test_intro_does_not_claim_only_failures_matter(self):
+        handler = _reload_handler()
+        _, body = handler._build_failure_alert(
+            self._results_with_change(), ["Google Chrome"], [], "req-1"
+        )
+        self.assertNotIn("Only the items under 'Failed' need attention", body)
+
+    def test_intro_unchanged_when_nothing_changed(self):
+        handler = _reload_handler()
+        results = [{"app": "Google Chrome", "status": "failed", "error": "boom"}]
+        _, body = handler._build_failure_alert(results, ["Google Chrome"], [], "req-1")
+        self.assertIn("Only the items under 'Failed' need attention", body)
+
+
+class TestLambdaHandlerMinimumVersionIntegration(unittest.TestCase):
+
+    def setUp(self):
+        self.handler = _reload_handler()
+        _disable_download_checks(self)
+        self._apps = self.handler.APPS
+        self.handler.APPS = [a for a in self.handler.APPS if a["name"] == "DRC INSIGHT"]
+
+        os.environ["TITLE_EDITOR_DRC_INSIGHT_TITLE_ID"] = "11"
+        self.addCleanup(os.environ.pop, "TITLE_EDITOR_DRC_INSIGHT_TITLE_ID", None)
+        os.environ.pop("JAMF_PRO_URL", None)
+        os.environ.pop("JAMF_PRO_SECRET_ID", None)
+
+        self.mock_ssm = MagicMock()
+        self.mock_ssm.get_parameter.side_effect = [
+            {"Parameter": {"Value": "testuser"}},
+            {"Parameter": {"Value": "testpass"}},
+        ]
+        self.cloudwatch = MagicMock()
+        self.mock_sns = MagicMock()
+
+    def tearDown(self):
+        self.handler.APPS = self._apps
+
+    def _boto_router(self):
+        def route(svc):
+            return {
+                "ssm": self.mock_ssm,
+                "cloudwatch": self.cloudwatch,
+                "sns": self.mock_sns,
+            }.get(svc, MagicMock())
+        return route
+
+    def _itunes_opener(self):
+        opener = MagicMock()
+        opener.open.return_value = _make_response(
+            '{"resultCount":1,"results":[{"version":"17.0.0",'
+            '"bundleId":"com.drc.wbte-ipad.drc"}]}', raw=True
+        )
+        return opener
+
+    def _changed_metric_values(self):
+        return [
+            c.kwargs["MetricData"][0]["Value"]
+            for c in self.cloudwatch.put_metric_data.call_args_list
+            if c.kwargs["MetricData"][0]["MetricName"] == "MinimumVersionChanged"
+        ]
+
+    def _run(self, sb_versions_resp, te_current="17.0.0", update_calls=0):
+        title_resp = _make_response({
+            "id": "drcinsight", "currentVersion": te_current,
+            "enabled": True, "patches": [],
+        })
+        responses = [_make_response({"token": "te-token"}), title_resp]
+        # Publishing a new version costs a patch POST and a title PUT.
+        responses += [_make_response({}) for _ in range(update_calls)]
+        if isinstance(sb_versions_resp, list):
+            responses += sb_versions_resp
+        else:
+            responses.append(sb_versions_resp)
+        with patch("handler.urllib.request.build_opener", return_value=self._itunes_opener()):
+            with patch("handler.urllib.request.urlopen", side_effect=responses):
+                with patch("handler.boto3.client", side_effect=self._boto_router()):
+                    return self.handler.lambda_handler({}, None)
+
+    def _known(self):
+        drc = next(a for a in self.handler.APPS if a["name"] == "DRC INSIGHT")
+        return drc["minimum_accepted_version"]["known"]
+
+    def test_unchanged_floor_emits_zero(self):
+        result = self._run(_make_response(
+            {"SecureClientVersion.Mac": {"minimumVersion": self._known(), "updateFile": ""}}
+        ))
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(self._changed_metric_values(), [0])
+        self.assertEqual(
+            [r for r in result["results"] if r.get("check") == "minimum_version"], []
+        )
+
+    def test_changed_floor_reported_without_failing_the_run(self):
+        """A moved floor is news, not a pipeline fault, so the sync still
+        reports success and the alarm carries the signal."""
+        result = self._run(_make_response(
+            {"SecureClientVersion.Mac": {"minimumVersion": "17.0.0", "updateFile": ""}}
+        ))
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(self._changed_metric_values(), [1])
+        entries = [r for r in result["results"] if r.get("check") == "minimum_version"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["status"], "changed")
+        self.assertIn("17.0.0", entries[0]["detail"])
+
+    def test_check_runs_even_when_the_app_sync_is_irrelevant_to_it(self):
+        """The floor check reads only vendor config, so an app updating (rather
+        than being current) must not change whether it runs."""
+        result = self._run(
+            _make_response(
+                {"SecureClientVersion.Mac": {"minimumVersion": self._known(), "updateFile": ""}}
+            ),
+            te_current="16.0.0",
+            update_calls=2,
+        )
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(self._changed_metric_values(), [0])
+        self.assertEqual(
+            [r for r in result["results"] if r.get("app") == "DRC INSIGHT"][0]["status"],
+            "updated",
+        )
+
+    def test_unreachable_feed_fails_the_run_and_publishes_no_metric(self):
+        """A check that could not answer must never be recorded as a clean 0,
+        which would clear a standing alarm."""
+        os.environ["ALERT_TOPIC_ARN"] = "arn:aws:sns:us-west-2:111122223333:test-alerts"
+        self.addCleanup(os.environ.pop, "ALERT_TOPIC_ARN", None)
+        err = urllib.error.URLError("connection refused")
+        with patch("time.sleep"):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._run([err, err])
+        self.assertIn("Minimum version check", str(ctx.exception))
+        self.mock_sns.publish.assert_called_once()
+        body = self.mock_sns.publish.call_args.kwargs["Message"]
+        self.assertIn("sb-versions", body)
+        self.assertIn("connection refused", body)
+        self.assertEqual(self._changed_metric_values(), [])
+
+    def test_shortfall_only_run_sends_no_email(self):
+        os.environ["ALERT_TOPIC_ARN"] = "arn:aws:sns:us-west-2:111122223333:test-alerts"
+        self.addCleanup(os.environ.pop, "ALERT_TOPIC_ARN", None)
+        self._run(_make_response(
+            {"SecureClientVersion.Mac": {"minimumVersion": "17.0.0", "updateFile": ""}}
+        ))
+        self.mock_sns.publish.assert_not_called()
 
 
 if __name__ == "__main__":

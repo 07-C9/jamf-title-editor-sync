@@ -186,6 +186,30 @@ def _fetch_version_electron_feed(url, app_name):
     return match.group(1)
 
 
+def _fetch_minimum_accepted_version(config, app_name):
+    """Reads the lowest version a vendor still accepts from their published
+    feed, walking json_path down to the value for our platform."""
+    def fetch():
+        req = urllib.request.Request(config["url"], headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+
+    data = _with_retries(f"minimum version source GET {config['url']}", fetch)
+    for key in config["json_path"]:
+        if not isinstance(data, dict) or key not in data:
+            raise ValueError(
+                f"No minimum accepted version at '{key}' for {app_name} "
+                f"({config['url']})"
+            )
+        data = data[key]
+    if not isinstance(data, str) or not re.fullmatch(r"\d+(\.\d+)*", data):
+        raise ValueError(
+            f"Minimum accepted version for {app_name} is not a version number: "
+            f"{data!r} ({config['url']})"
+        )
+    return data
+
+
 def _fetch_latest_version(app_config):
     source = app_config["version_source"]
     source_type = source["type"]
@@ -435,6 +459,36 @@ def _run_jamf_pro_drift_check(te_state):
     return drifted
 
 
+def _run_minimum_version_checks():
+    """Reports when a vendor's published minimum accepted version differs from
+    the value recorded in apps.json. Patch reporting already shows who is behind
+    the newest release; only this shows the moment being behind turns into being
+    refused, because that number moves on the vendor's schedule and changes
+    nothing on disk. Returns (changes, errors)."""
+    changes, errors = [], []
+    for app in APPS:
+        config = app.get("minimum_accepted_version")
+        if not config or not app.get("enabled", True):
+            continue
+        if "known" not in config:
+            errors.append(
+                f"{app['name']}: minimum_accepted_version has no 'known' value in apps.json"
+            )
+            continue
+        try:
+            live = _fetch_minimum_accepted_version(config, app["name"])
+        except Exception as e:
+            # One dead feed must not discard changes already found for other apps.
+            errors.append(str(e))
+            continue
+        if live != config["known"]:
+            changes.append(
+                f"{app['name']}: vendor minimum accepted version is now {live} "
+                f"(apps.json records {config['known']})"
+            )
+    return changes, errors
+
+
 def _build_failure_alert(results, failures, download_failures, request_id):
     function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "jamf-title-editor-sync")
     region = os.environ.get("AWS_REGION", "us-west-2")
@@ -444,7 +498,15 @@ def _build_failure_alert(results, failures, download_failures, request_id):
     if len(subject) > 100:
         subject = subject[:97] + "..."
 
-    lines = [f"{function_name} run failed. Only the items under 'Failed' need attention.", ""]
+    changed = [r for r in results if r.get("status") == "changed"]
+    if changed:
+        intro = (
+            f"{function_name} run failed. Items under 'Failed' and 'Vendor minimum "
+            f"version changed' both need attention."
+        )
+    else:
+        intro = f"{function_name} run failed. Only the items under 'Failed' need attention."
+    lines = [intro, ""]
     lines.append("Failed:")
     for r in results:
         if r.get("status") != "failed":
@@ -458,6 +520,12 @@ def _build_failure_alert(results, failures, download_failures, request_id):
                     "    (post-sync check that Jamf Pro is ingesting Title Editor"
                     " definitions; not an app sync, the app sync results are below)"
                 )
+    if changed:
+        lines.append("")
+        lines.append("Vendor minimum version changed (nothing on disk changed; the bar moved):")
+        for r in changed:
+            lines.append(f"  - {r['detail']}")
+
     app_results = [r for r in results if "app" in r]
     ok = [r for r in app_results if r.get("status") in ("current", "updated")]
     if app_results:
@@ -572,6 +640,34 @@ def lambda_handler(event, context):
                 "check": "jamfpro_drift", "status": "failed",
                 "detail": f"Jamf Pro drift check: {e}",
             })
+
+    try:
+        changes, min_version_errors = _run_minimum_version_checks()
+    except Exception as e:
+        changes, min_version_errors = [], [str(e)]
+
+    for item in changes:
+        logger.warning(f"Vendor minimum version changed: {item}")
+        results.append({"check": "minimum_version", "status": "changed", "detail": item})
+    for error in min_version_errors:
+        logger.error(f"Minimum version check failed - {error}")
+        results.append({
+            "check": "minimum_version", "status": "failed",
+            "detail": f"Minimum version check: {error}",
+        })
+    if min_version_errors:
+        failures.append("Minimum version check")
+    else:
+        # Only record a count the check actually established. Publishing 0 after
+        # a failed check would clear a standing alarm with a number nobody measured.
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="JamfPatchSync",
+            MetricData=[{
+                "MetricName": "MinimumVersionChanged",
+                "Value": len(changes),
+                "Unit": "Count",
+            }],
+        )
 
     if failures or download_failures:
         _publish_failure_alert(

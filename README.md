@@ -323,6 +323,26 @@ This is deliberately a health check, not a patch title. Adobe's ESD build number
 
 A failure emits the `DownloadUrlCheckFailures` metric and raises at the end of the run, so both the `Errors` alarm and the dedicated download-URL alarm email you (see [Monitoring](#monitoring)).
 
+## Vendor minimum version check
+
+Patch reporting answers "how many machines are behind the newest release". For software that has to talk to a vendor's service, there is a second number the vendor controls: the lowest version it will still accept. That number moves on the vendor's schedule and changes nothing on disk, so no patch report can show it moving.
+
+DRC INSIGHT is the reason this exists. WIDA publishes the minimum secure-browser version its ACCESS testing platform accepts, at a public unauthenticated endpoint. While that floor sits below the newest release, a machine one version behind is untidy. The moment the floor is raised past it, the same machine is refused and a student cannot start a test. The patch report looks identical before and after.
+
+So the check does one thing: it tells you when that number changes. Any app in `apps.json` can declare one:
+
+```json
+"minimum_accepted_version": {
+  "url": "https://eca-te-common-service-wida.te.drcedirect.com/sb-versions",
+  "json_path": ["SecureClientVersion.Mac", "minimumVersion"],
+  "known": "16.0.0"
+}
+```
+
+`json_path` walks the response down to the version string, and `known` is the value you have already seen and accounted for. Each run compares the two. Any difference emits `MinimumVersionChanged` and raises its alarm, including a floor that drops, which is equally worth knowing. You acknowledge a move by updating `known` and redeploying.
+
+A change does not fail the run, because the sync itself is fine. A feed that cannot be reached does fail it, and in that case no metric is published at all, so a check that could not answer is never recorded as a clean zero. The alarm holds its state through missing data rather than clearing on it.
+
 ## Cost
 
 Under $1/month. The Lambda runs for a few seconds twice a day. Everything falls within AWS free tier at this scale except the handful of custom CloudWatch metrics it publishes (a few cents a month).
@@ -493,17 +513,17 @@ terraform apply
 | Type | How it works | Example |
 |------|-------------|---------|
 | `google_versionhistory` | Fetches JSON, reads `releases[0].version` | Chrome VersionHistory API |
-| `html_scrape` | Fetches HTML, applies `regex` capture group to extract version | ScreenConnect productVersion page |
+| `html_scrape` | Fetches a text response (HTML, JSON or XML), applies `regex` capture group to extract version | ScreenConnect productVersion page |
 | `github_releases` | Fetches latest GitHub release, reads `tag_name`, strips `v` prefix. Optional `version_parts` truncates to N segments. | MacAdmins Python |
 | `redirect_filename` | Issues the request with redirects disabled, reads the version from the `Location` header's filename via `regex`. Never downloads the body. | Washington Secure Browser geturls redirect |
 | `electron_updater_feed` | Fetches an electron-updater YAML feed, reads the top-level `version:` line | GMetrix latest-mac.yml |
 
 ## Monitoring
 
-Four CloudWatch alarms, all emailing via SNS:
+Five CloudWatch alarms, all emailing via SNS:
 
 - Errors: Lambda threw an exception (auth failure, API error, code bug)
-- Duration: Execution approaching the 30-second timeout
+- Duration: Execution approaching the 90-second timeout
 - No invocations (24h): Scheduler stopped firing (deleted, misconfigured)
 - Download-URL failure: the canary found a dead installer URL (e.g. an Adobe CC build-path change), reported via the `DownloadUrlCheckFailures` metric
 
@@ -511,7 +531,7 @@ When a run fails, the Lambda also emails the detail to the same topic before it 
 
 The Errors and Duration alarms ignore missing data because the function only runs twice a day. Once one fires it stays in ALARM until a later run posts a clean datapoint, so an OK email means a later run came back clean. Async retries are off; retrying a broken version source a minute later fails the same way, so a failed run just waits for the next scheduled one.
 
-An optional fifth alarm watches whether Jamf Pro is actually ingesting what the Lambda pushes. When `jamf_pro_url` and `jamf_pro_secret_name` are set in `terraform.tfvars` (a read-only Jamf Pro API client with the patch read privileges, stored in Secrets Manager as JSON keys `client_id` and `client_secret`), each run compares Jamf Pro's latest ingested definition per title against Title Editor and emits a `JamfProDefinitionLag` metric. Lag right after a push is normal, so the alarm fires only when a title stays diverged across two consecutive runs. That pattern is what a dropped Title Editor connection looks like, and since Jamf Pro 11.28 the connection cannot re-establish itself; the fix is re-saving the external patch source in Jamf Pro settings.
+An optional sixth alarm watches whether Jamf Pro is actually ingesting what the Lambda pushes. When `jamf_pro_url` and `jamf_pro_secret_name` are set in `terraform.tfvars` (a read-only Jamf Pro API client with the patch read privileges, stored in Secrets Manager as JSON keys `client_id` and `client_secret`), each run compares Jamf Pro's latest ingested definition per title against Title Editor and emits a `JamfProDefinitionLag` metric. Lag right after a push is normal, so the alarm fires only when a title stays diverged across two consecutive runs. That pattern is what a dropped Title Editor connection looks like, and since Jamf Pro 11.28 the connection cannot re-establish itself; the fix is re-saving the external patch source in Jamf Pro settings.
 
 ### When you get an alert
 
@@ -522,6 +542,7 @@ An optional fifth alarm watches whether Jamf Pro is actually ingesting what the 
 | Duration | Slow API response | Consider bumping the Lambda timeout |
 | Download-URL failure | Vendor changed or pulled an installer URL | Check CloudWatch Logs for the failing arch/URL, fix the Installomator label, re-verify |
 | Definition lag | Jamf Pro stopped pulling from Title Editor | Re-save the external patch source in Jamf Pro settings, then confirm the next runs post JamfProDefinitionLag=0 |
+| Minimum version changed | Vendor moved the lowest version it still accepts | Confirm the new number and that the required version is deployed, then update `known` in `lambda/apps.json` and redeploy to acknowledge |
 
 ## Security
 

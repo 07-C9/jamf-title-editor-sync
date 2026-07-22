@@ -338,5 +338,102 @@
         }
       ]
     }
+  },
+  {
+    "name": "DYMO Connect",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_DYMO_CONNECT_TITLE_ID",
+    "version_source": {
+      "type": "html_scrape",
+      "url": "https://download.dymo.com/Software/dymoconnect/updates/Mac/Updates.xml",
+      "regex": "<Version>([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)</Version>"
+    },
+    "version_pattern": "^\\d+\\.\\d+\\.\\d+\\.\\d+$",
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "10.15.0",
+      "killApps": [],
+      "components": [
+        {
+          "name": "DYMO Connect",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "Application Bundle ID",
+              "operator": "is",
+              "value": "com.dymo.dymo-connect",
+              "type": "recon"
+            },
+            {
+              "name": "Application Version",
+              "operator": "is",
+              "value": "{version}",
+              "type": "recon"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "10.15.0",
+          "type": "recon"
+        }
+      ]
+    }
+  },
+  {
+    "name": "DRC INSIGHT",
+    "enabled": true,
+    "title_id_env_var": "TITLE_EDITOR_DRC_INSIGHT_TITLE_ID",
+    "version_source": {
+      "type": "html_scrape",
+      "url": "https://itunes.apple.com/lookup?id=964905738",
+      "regex": "\"version\":\"([0-9]+\\.[0-9]+\\.[0-9]+)\""
+    },
+    "version_pattern": "^\\d+\\.\\d+\\.\\d+$",
+    "minimum_accepted_version": {
+      "url": "https://eca-te-common-service-wida.te.drcedirect.com/sb-versions",
+      "json_path": ["SecureClientVersion.Mac", "minimumVersion"],
+      "known": "16.0.0"
+    },
+    "patch_template": {
+      "enabled": true,
+      "standalone": true,
+      "reboot": false,
+      "minimumOperatingSystem": "14.6",
+      "killApps": [],
+      "components": [
+        {
+          "name": "DRC INSIGHT",
+          "version": "{version}",
+          "criteria": [
+            {
+              "name": "Application Bundle ID",
+              "operator": "is",
+              "value": "com.datarecognitioncorp.drcinsight.mac.sqa",
+              "type": "recon"
+            },
+            {
+              "name": "Application Version",
+              "operator": "is",
+              "value": "{version}",
+              "type": "recon"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "name": "Operating System Version",
+          "operator": "greater than",
+          "value": "14.6",
+          "type": "recon"
+        }
+      ]
+    }
   }
 ]
