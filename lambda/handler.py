@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +20,42 @@ import boto3
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+TRANSIENT_HTTP_STATUSES = (500, 502, 503, 504)
+RETRY_BACKOFF_SECONDS = 2
+
+
+def _is_timeout(exc):
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(exc, urllib.error.URLError) and isinstance(
+        getattr(exc, "reason", None), TimeoutError
+    )
+
+
+def _is_transient(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in TRANSIENT_HTTP_STATUSES
+    return isinstance(exc, (TimeoutError, urllib.error.URLError))
+
+
+def _with_retries(label, fn, attempts=2, retry_timeouts=True):
+    """Runs fn, retrying transient failures (5xx, timeouts, connection errors)
+    so a single blip does not fail the run. Every failure re-raises tagged with
+    the request label so alerts name the exact call that broke. Only use on
+    idempotent requests. retry_timeouts=False exempts timeouts from retry for
+    calls whose timeout budget is too large to spend twice."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            retryable = _is_transient(e) and (retry_timeouts or not _is_timeout(e))
+            if attempt < attempts and retryable:
+                logger.warning(f"{label}: {e} - retrying")
+                time.sleep(RETRY_BACKOFF_SECONDS)
+                continue
+            suffix = f" (failed {attempt} attempts)" if attempt > 1 else ""
+            raise RuntimeError(f"{label}: {e}{suffix}") from e
 
 APPS = json.loads((Path(__file__).parent / "apps.json").read_text())
 
@@ -51,23 +88,30 @@ def _get_credentials():
 
 def _get_title_editor_token(base_url, username, password):
     auth_string = base64.b64encode(f"{username}:{password}".encode()).decode()
-    req = urllib.request.Request(
-        f"{base_url}/v2/auth/tokens",
-        method="POST",
-        headers={
-            "Authorization": f"Basic {auth_string}",
-            "Content-Type": "application/json",
-        },
-        data=b"{}",
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())["token"]
+
+    def fetch():
+        req = urllib.request.Request(
+            f"{base_url}/v2/auth/tokens",
+            method="POST",
+            headers={
+                "Authorization": f"Basic {auth_string}",
+                "Content-Type": "application/json",
+            },
+            data=b"{}",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())["token"]
+
+    return _with_retries(f"Title Editor auth POST {base_url}/v2/auth/tokens", fetch)
 
 
 def _fetch_version_json(url, app_name):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read())
+    def fetch():
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+
+    data = _with_retries(f"version source GET {url}", fetch)
     releases = data.get("releases", [])
     if not releases:
         raise ValueError(f"No releases found for {app_name}")
@@ -75,11 +119,14 @@ def _fetch_version_json(url, app_name):
 
 
 def _fetch_version_html(url, regex, app_name):
-    cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-    req = urllib.request.Request(url)
-    with opener.open(req, timeout=15) as resp:
-        text = resp.read().decode()
+    def fetch():
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        req = urllib.request.Request(url)
+        with opener.open(req, timeout=15) as resp:
+            return resp.read().decode()
+
+    text = _with_retries(f"version source GET {url}", fetch)
     match = re.search(regex, text)
     if not match:
         raise ValueError(f"No version found for {app_name}")
@@ -87,9 +134,12 @@ def _fetch_version_html(url, regex, app_name):
 
 
 def _fetch_version_github(url, version_parts, app_name):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read())
+    def fetch():
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+
+    data = _with_retries(f"version source GET {url}", fetch)
     tag = data.get("tag_name")
     if not tag:
         raise ValueError(f"No tag_name found for {app_name}")
@@ -104,12 +154,19 @@ def _fetch_version_redirect(url, regex, app_name):
         def redirect_request(self, *args, **kwargs):
             return None
 
-    opener = urllib.request.build_opener(_NoRedirect)
-    try:
-        with opener.open(urllib.request.Request(url), timeout=15) as resp:
-            location = resp.headers.get("Location", "")
-    except urllib.error.HTTPError as e:
-        location = e.headers.get("Location", "")
+    def fetch():
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            with opener.open(urllib.request.Request(url), timeout=15) as resp:
+                return resp.headers.get("Location", "")
+        except urllib.error.HTTPError as e:
+            # A redirect status IS the expected response here; only server
+            # trouble should escape to the retry wrapper.
+            if e.code in TRANSIENT_HTTP_STATUSES:
+                raise
+            return e.headers.get("Location", "")
+
+    location = _with_retries(f"version source GET {url}", fetch)
     match = re.search(regex, location)
     if not match:
         raise ValueError(f"No version found in redirect Location for {app_name}")
@@ -117,9 +174,12 @@ def _fetch_version_redirect(url, regex, app_name):
 
 
 def _fetch_version_electron_feed(url, app_name):
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        text = resp.read().decode()
+    def fetch():
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.read().decode()
+
+    text = _with_retries(f"version source GET {url}", fetch)
     match = re.search(r"(?m)^version:\s*['\"]?([0-9][0-9A-Za-z.+-]*)['\"]?\s*$", text)
     if not match:
         raise ValueError(f"No version found for {app_name}")
@@ -170,8 +230,11 @@ def _title_editor_request(base_url, token, method, path, body=None):
 
 
 def _get_title_info(base_url, token, title_id):
-    return _title_editor_request(
-        base_url, token, "GET", f"/v2/softwaretitles/{title_id}"
+    return _with_retries(
+        f"Title Editor GET {base_url}/v2/softwaretitles/{title_id}",
+        lambda: _title_editor_request(
+            base_url, token, "GET", f"/v2/softwaretitles/{title_id}"
+        ),
     )
 
 
@@ -311,13 +374,19 @@ def _get_jamf_pro_token(base_url, client_id, client_secret):
         return json.loads(resp.read())["access_token"]
 
 
-def _jamf_pro_get(base_url, token, path, accept):
-    req = urllib.request.Request(
-        f"{base_url}{path}",
-        headers={"Authorization": f"Bearer {token}", "Accept": accept},
+def _jamf_pro_get(base_url, token, path, accept, label=None, timeout=15, retry_timeouts=True):
+    def fetch():
+        req = urllib.request.Request(
+            f"{base_url}{path}",
+            headers={"Authorization": f"Bearer {token}", "Accept": accept},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+
+    return _with_retries(
+        label or f"GET {base_url}{path} ({timeout}s timeout)",
+        fetch, retry_timeouts=retry_timeouts,
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return resp.read()
 
 
 def _run_jamf_pro_drift_check(te_state):
@@ -326,18 +395,28 @@ def _run_jamf_pro_drift_check(te_state):
     run confirmed in Title Editor. Returns divergence strings (empty = current)."""
     base_url = os.environ["JAMF_PRO_URL"].rstrip("/")
     client_id, client_secret = _get_jamf_pro_credentials()
-    token = _get_jamf_pro_token(base_url, client_id, client_secret)
+    token = _with_retries(
+        f"OAuth token POST {base_url}/api/oauth/token",
+        lambda: _get_jamf_pro_token(base_url, client_id, client_secret),
+    )
 
+    # This endpoint serializes every patch config on the instance and answers
+    # in 13-17s here; give it a budget well above that, and never spend the
+    # budget twice (a second stall would leave no Lambda time to send the
+    # failure email).
     configs = json.loads(_jamf_pro_get(
-        base_url, token, "/api/v2/patch-software-title-configurations", "application/json"
+        base_url, token, "/api/v2/patch-software-title-configurations", "application/json",
+        timeout=45, retry_timeouts=False,
     ))
     drifted = []
     for config in configs:
         if config.get("jamfOfficial", True):
             continue
+        detail_path = f"/JSSResource/patchsoftwaretitles/id/{config['id']}"
         xml_body = _jamf_pro_get(
-            base_url, token,
-            f"/JSSResource/patchsoftwaretitles/id/{config['id']}", "application/xml",
+            base_url, token, detail_path, "application/xml",
+            label=f"patch config {config['id']} ({config.get('displayName')}) "
+                  f"GET {base_url}{detail_path}",
         )
         # Jamf Pro classic API responses never carry a DTD; refuse any that do
         # rather than expose the parser to entity-expansion tricks.
@@ -374,9 +453,19 @@ def _build_failure_alert(results, failures, download_failures, request_id):
             lines.append(f"  - {r['app']}: {r['error']}")
         else:
             lines.append(f"  - {r['detail']}")
-    ok = [r for r in results if r.get("status") in ("current", "updated")]
-    lines.append("")
-    lines.append(f"OK this run ({len(ok)}):")
+            if r.get("check") == "jamfpro_drift":
+                lines.append(
+                    "    (post-sync check that Jamf Pro is ingesting Title Editor"
+                    " definitions; not an app sync, the app sync results are below)"
+                )
+    app_results = [r for r in results if "app" in r]
+    ok = [r for r in app_results if r.get("status") in ("current", "updated")]
+    if app_results:
+        lines.append("")
+        if len(ok) == len(app_results):
+            lines.append(f"App syncs - all {len(ok)} OK:")
+        else:
+            lines.append(f"App syncs OK ({len(ok)} of {len(app_results)}):")
     for r in ok:
         if r["status"] == "current":
             lines.append(f"  - {r['app']}: current at {r['version']}")
@@ -403,8 +492,19 @@ def _publish_failure_alert(results, failures, download_failures, request_id):
 
 def lambda_handler(event, context):
     base_url = os.environ["TITLE_EDITOR_URL"].rstrip("/")
-    username, password = _get_credentials()
-    token = _get_title_editor_token(base_url, username, password)
+    try:
+        username, password = _get_credentials()
+        token = _get_title_editor_token(base_url, username, password)
+    except Exception as e:
+        # Nothing can sync without a Title Editor session; still send the
+        # detail email before dying so the alert names the failing call.
+        logger.error(f"Title Editor auth failed - {e}")
+        _publish_failure_alert(
+            [{"check": "auth", "status": "failed", "detail": str(e)}],
+            ["Title Editor auth"], [],
+            getattr(context, "aws_request_id", "unknown"),
+        )
+        raise
 
     results = []
     failures = []

@@ -711,6 +711,122 @@ class TestFetchVersionRedirect(unittest.TestCase):
             self.assertIn("No version found", str(ctx.exception))
 
 
+class TestTransientRetries(unittest.TestCase):
+    """A single transient failure (5xx, timeout) on an idempotent call must not
+    fail the run; exhausted retries must name the exact request that failed."""
+
+    def setUp(self):
+        self.handler = _reload_handler()
+        sleep_patch = patch("time.sleep")
+        sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
+
+    def _github_config(self):
+        return {
+            "name": "Outset",
+            "version_source": {
+                "type": "github_releases",
+                "url": "https://api.github.com/repos/macadmins/outset/releases/latest",
+            },
+            "version_pattern": "^\\d+\\.\\d+\\.\\d+\\.\\d+$",
+        }
+
+    def _http_error(self, code, msg, url="https://api.github.com/repos/macadmins/outset/releases/latest"):
+        import urllib.error
+        return urllib.error.HTTPError(url=url, code=code, msg=msg, hdrs={}, fp=io.BytesIO(b""))
+
+    def test_version_fetch_retries_503_then_succeeds(self):
+        ok = _make_response({"tag_name": "v4.3.0.22031"})
+        responses = [self._http_error(503, "Service Unavailable"), ok]
+        with patch("handler.urllib.request.urlopen", side_effect=responses) as urlopen_mock:
+            version = self.handler._fetch_latest_version(self._github_config())
+        self.assertEqual(version, "4.3.0.22031")
+        self.assertEqual(urlopen_mock.call_count, 2)
+
+    def test_version_fetch_exhausted_retries_name_the_url(self):
+        responses = [
+            self._http_error(503, "Service Unavailable"),
+            self._http_error(503, "Service Unavailable"),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.handler._fetch_latest_version(self._github_config())
+        msg = str(ctx.exception)
+        self.assertIn("https://api.github.com/repos/macadmins/outset/releases/latest", msg)
+        self.assertIn("503", msg)
+        self.assertIn("2 attempts", msg)
+
+    def test_version_fetch_404_not_retried(self):
+        with patch("handler.urllib.request.urlopen", side_effect=[self._http_error(404, "Not Found")]) as urlopen_mock:
+            with self.assertRaises(RuntimeError) as ctx:
+                self.handler._fetch_latest_version(self._github_config())
+        self.assertEqual(urlopen_mock.call_count, 1)
+        self.assertIn("404", str(ctx.exception))
+
+    def test_read_timeout_retried_then_succeeds(self):
+        ok = _make_response({"tag_name": "v4.3.0.22031"})
+        responses = [TimeoutError("The read operation timed out"), ok]
+        with patch("handler.urllib.request.urlopen", side_effect=responses) as urlopen_mock:
+            version = self.handler._fetch_latest_version(self._github_config())
+        self.assertEqual(version, "4.3.0.22031")
+        self.assertEqual(urlopen_mock.call_count, 2)
+
+    def test_title_editor_auth_retries_503_then_succeeds(self):
+        ok = _make_response({"token": "te-token"})
+        err = self._http_error(503, "Service Unavailable",
+                               url="https://test.appcatalog.jamfcloud.com/v2/auth/tokens")
+        with patch("handler.urllib.request.urlopen", side_effect=[err, ok]) as urlopen_mock:
+            token = self.handler._get_title_editor_token(
+                "https://test.appcatalog.jamfcloud.com", "u", "p"
+            )
+        self.assertEqual(token, "te-token")
+        self.assertEqual(urlopen_mock.call_count, 2)
+
+    def test_title_info_failure_names_title_editor(self):
+        err_url = "https://test.appcatalog.jamfcloud.com/v2/softwaretitles/9"
+        responses = [
+            self._http_error(503, "Service Unavailable", url=err_url),
+            self._http_error(503, "Service Unavailable", url=err_url),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.handler._get_title_info(
+                    "https://test.appcatalog.jamfcloud.com", "tok", "9"
+                )
+        msg = str(ctx.exception)
+        self.assertIn("Title Editor", msg)
+        self.assertIn("/v2/softwaretitles/9", msg)
+
+    def test_redirect_fetch_retries_503_then_reads_location(self):
+        import email.message
+        import urllib.error
+        hdrs = email.message.Message()
+        hdrs["Location"] = ("https://cai-sb-prod.s3.amazonaws.com/washington/secureBrowsers/"
+                            "SB2022/WASecureBrowser18.0-2025-05-22-universal-signed.dmg")
+        redirect = urllib.error.HTTPError(
+            url="https://sb.portal.cambiumast.com/geturls",
+            code=301, msg="Moved Permanently", hdrs=hdrs, fp=io.BytesIO(b""),
+        )
+        app_config = {
+            "name": "Washington Secure Browser",
+            "version_source": {
+                "type": "redirect_filename",
+                "url": "https://sb.portal.cambiumast.com/geturls?clientName=washington&operatingSystem=macOS",
+                "regex": "WASecureBrowser([0-9]+\\.[0-9]+)-[0-9-]+-universal-signed\\.dmg",
+            },
+            "version_pattern": "^\\d+\\.\\d+$",
+        }
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = [
+            self._http_error(503, "Service Unavailable", url="https://sb.portal.cambiumast.com/geturls"),
+            redirect,
+        ]
+        with patch("handler.urllib.request.build_opener", return_value=mock_opener):
+            version = self.handler._fetch_latest_version(app_config)
+        self.assertEqual(version, "18.0")
+        self.assertEqual(mock_opener.open.call_count, 2)
+
+
 class TestMacAdminsPythonPatchBody(unittest.TestCase):
 
     def test_ea_based_criteria_version_substitution(self):
@@ -1092,6 +1208,37 @@ class TestBuildFailureAlert(unittest.TestCase):
         self.assertIn("download URL checks", subject)
         self.assertIn(detail, body)
 
+    def test_drift_failure_names_call_and_separates_app_syncs(self):
+        handler = _reload_handler()
+        detail = ("Jamf Pro drift check: GET https://jss.example.com:8443/api/v2/"
+                  "patch-software-title-configurations (45s timeout): The read operation timed out")
+        results = [
+            {"app": f"App {i}", "status": "current", "version": "1.0"} for i in range(8)
+        ] + [{"check": "jamfpro_drift", "status": "failed", "detail": detail}]
+        _, body = handler._build_failure_alert(results, ["Jamf Pro drift check"], [], "req-9")
+        self.assertIn(detail, body)
+        self.assertIn("App syncs - all 8 OK:", body)
+        self.assertIn("not an app sync", body)
+
+    def test_partial_app_failures_counted_in_ok_header(self):
+        handler = _reload_handler()
+        results = (
+            [{"app": f"App {i}", "status": "current", "version": "1.0"} for i in range(5)]
+            + [{"app": "Bad App", "status": "failed", "error": "HTTP Error 503: Service Unavailable"}]
+            + [{"check": "jamfpro_drift", "status": "failed", "detail": "Jamf Pro drift check: boom"}]
+        )
+        _, body = handler._build_failure_alert(
+            results, ["Bad App", "Jamf Pro drift check"], [], "req-9"
+        )
+        self.assertIn("App syncs OK (5 of 6):", body)
+
+    def test_no_app_results_omits_app_sync_section(self):
+        handler = _reload_handler()
+        results = [{"check": "auth", "status": "failed", "detail": "Title Editor auth: HTTP Error 503"}]
+        _, body = handler._build_failure_alert(results, ["Title Editor auth"], [], "req-9")
+        self.assertIn("Title Editor auth", body)
+        self.assertNotIn("App syncs", body)
+
 
 class TestFailureAlertPublish(unittest.TestCase):
 
@@ -1175,6 +1322,27 @@ class TestFailureAlertPublish(unittest.TestCase):
         self.assertEqual(result["statusCode"], 200)
         requested_services = [c.args[0] for c in boto_mock.call_args_list]
         self.assertNotIn("sns", requested_services)
+
+    def test_te_auth_failure_publishes_detail_and_raises(self):
+        import urllib.error
+        def auth_503():
+            return urllib.error.HTTPError(
+                "https://test.appcatalog.jamfcloud.com/v2/auth/tokens", 503,
+                "Service Unavailable", {}, io.BytesIO(b""),
+            )
+        ctx_obj = types.SimpleNamespace(aws_request_id="req-auth-7")
+        with patch("handler.urllib.request.urlopen", side_effect=[auth_503(), auth_503()]):
+            with patch("handler.boto3.client", side_effect=self._boto_router()):
+                with patch("time.sleep"):
+                    with self.assertRaises(Exception):
+                        self.handler.lambda_handler({}, ctx_obj)
+
+        self.mock_sns.publish.assert_called_once()
+        kwargs = self.mock_sns.publish.call_args.kwargs
+        self.assertIn("Title Editor auth", kwargs["Subject"])
+        self.assertIn("/v2/auth/tokens", kwargs["Message"])
+        self.assertIn("503", kwargs["Message"])
+        self.assertIn("req-auth-7", kwargs["Message"])
 
 
 JAMF_PRO_V2_CONFIGS = [
@@ -1284,6 +1452,78 @@ class TestJamfProDriftCheck(unittest.TestCase):
         self.assertIn("client_id=cid", body)
         self.assertIn("client_secret=csec", body)
         self.assertEqual(req.get_header("Content-type"), "application/x-www-form-urlencoded")
+
+    def test_config_list_timeout_names_call_and_is_not_retried(self):
+        te_state = {"googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"}}
+        responses = [
+            _make_response({"access_token": "jp-token"}),
+            TimeoutError("The read operation timed out"),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses) as urlopen_mock:
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                with patch("time.sleep"):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self.handler._run_jamf_pro_drift_check(te_state)
+        msg = str(ctx.exception)
+        self.assertIn("/api/v2/patch-software-title-configurations", msg)
+        self.assertIn("The read operation timed out", msg)
+        self.assertEqual(urlopen_mock.call_count, 2)
+
+    def test_config_list_gets_45s_timeout(self):
+        responses = [_make_response({"access_token": "jp-token"}), _make_response([])]
+        with patch("handler.urllib.request.urlopen", side_effect=responses) as urlopen_mock:
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                self.handler._run_jamf_pro_drift_check({})
+        self.assertEqual(urlopen_mock.call_args_list[1].kwargs.get("timeout"), 45)
+
+    def test_oauth_token_503_retried_then_succeeds(self):
+        import urllib.error
+        err = urllib.error.HTTPError(
+            "https://jamf.test:8443/api/oauth/token", 503,
+            "Service Unavailable", {}, io.BytesIO(b""),
+        )
+        responses = [err, _make_response({"access_token": "jp-token"}), _make_response([])]
+        with patch("handler.urllib.request.urlopen", side_effect=responses) as urlopen_mock:
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                with patch("time.sleep"):
+                    drifted = self.handler._run_jamf_pro_drift_check({})
+        self.assertEqual(drifted, [])
+        self.assertEqual(urlopen_mock.call_count, 3)
+
+    def test_config_xml_timeout_retried_then_succeeds(self):
+        te_state = {"googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"}}
+        v2_one_config = [{"id": "201", "displayName": "Google Chrome", "jamfOfficial": False}]
+        responses = [
+            _make_response({"access_token": "jp-token"}),
+            _make_response(v2_one_config),
+            TimeoutError("The read operation timed out"),
+            _make_response(JAMF_PRO_XML_CHROME, raw=True),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses) as urlopen_mock:
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                with patch("time.sleep"):
+                    drifted = self.handler._run_jamf_pro_drift_check(te_state)
+        self.assertEqual(drifted, [])
+        self.assertEqual(urlopen_mock.call_count, 4)
+
+    def test_config_xml_failure_names_title(self):
+        te_state = {"googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"}}
+        v2_one_config = [{"id": "201", "displayName": "Google Chrome", "jamfOfficial": False}]
+        responses = [
+            _make_response({"access_token": "jp-token"}),
+            _make_response(v2_one_config),
+            TimeoutError("The read operation timed out"),
+            TimeoutError("The read operation timed out"),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                with patch("time.sleep"):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self.handler._run_jamf_pro_drift_check(te_state)
+        msg = str(ctx.exception)
+        self.assertIn("Google Chrome", msg)
+        self.assertIn("/JSSResource/patchsoftwaretitles/id/201", msg)
+        self.assertIn("2 attempts", msg)
 
 
 class TestLambdaHandlerDriftIntegration(unittest.TestCase):
@@ -1397,20 +1637,22 @@ class TestLambdaHandlerDriftIntegration(unittest.TestCase):
         self.addCleanup(os.environ.pop, "ALERT_TOPIC_ARN", None)
 
         import urllib.error
-        responses = self._sync_responses() + [
-            urllib.error.HTTPError("https://jamf.test:8443/api/oauth/token", 503,
-                                   "Service Unavailable", {}, io.BytesIO(b"")),
-        ]
+        def oauth_503():
+            return urllib.error.HTTPError("https://jamf.test:8443/api/oauth/token", 503,
+                                          "Service Unavailable", {}, io.BytesIO(b""))
+        responses = self._sync_responses() + [oauth_503(), oauth_503()]
         with patch("handler.urllib.request.urlopen", side_effect=responses):
             with patch("handler.boto3.client", side_effect=self._boto_router()):
-                with self.assertRaises(RuntimeError) as ctx:
-                    self.handler.lambda_handler({}, None)
+                with patch("time.sleep"):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self.handler.lambda_handler({}, None)
 
         self.assertIn("Jamf Pro drift check", str(ctx.exception))
         self.mock_sns.publish.assert_called_once()
         message = self.mock_sns.publish.call_args.kwargs["Message"]
         self.assertIn("Jamf Pro drift check", message)
         self.assertIn("503", message)
+        self.assertIn("/api/oauth/token", message)
 
 
 class TestTitleEditorAuth(unittest.TestCase):
