@@ -64,8 +64,9 @@ def _with_retries(label, fn, attempts=2, retry_timeouts=True):
             suffix = f" (failed {attempt} attempts)" if attempt > 1 else ""
             # Some exceptions stringify to nothing useful (a malformed status
             # line is bare CRLF), which left alerts ending at the colon. Fall
-            # back to the type, and keep the text on one line for the email.
-            detail = " ".join(str(e).split()) or type(e).__name__
+            # back to the type, keep the text on one line, and bound its length
+            # since it is external data headed for an alert email.
+            detail = " ".join(str(e).split())[:500] or type(e).__name__
             raise RuntimeError(f"{label}: {detail}{suffix}") from e
 
 
@@ -232,7 +233,7 @@ def _fetch_minimum_accepted_version(config, app_name):
     if not isinstance(data, str) or not re.fullmatch(r"\d+(\.\d+)*", data):
         raise ValueError(
             f"Minimum accepted version for {app_name} is not a version number: "
-            f"{data!r} ({config['url']})"
+            f"{repr(data)[:200]} ({config['url']})"
         )
     return data
 
@@ -272,7 +273,7 @@ def _fetch_latest_version(app_config):
         raise ValueError(f"Unknown version source type: {source_type}")
 
     pattern = re.compile(app_config["version_pattern"])
-    if not pattern.match(version):
+    if not pattern.fullmatch(version):
         raise ValueError(
             f"Version '{version}' does not match pattern '{app_config['version_pattern']}'"
         )
@@ -369,7 +370,10 @@ def _http_get_text(url, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode()
 
-    return _with_retries(f"download config GET {url}", fetch)
+    # The canary runs after the app loop; a retried timeout spends a full
+    # socket budget twice and can push the run past the Lambda ceiling. A 5xx
+    # blip still retries (cheap); a timeout settles in one attempt.
+    return _with_retries(f"download config GET {url}", fetch, retry_timeouts=False)
 
 
 def _adobe_ccd_download_url(cc_arch):
@@ -405,7 +409,7 @@ def _url_is_live(url, timeout=20):
             return e.code in (200, 206)
 
     try:
-        return _with_retries(f"download URL check {url}", fetch)
+        return _with_retries(f"download URL check {url}", fetch, retry_timeouts=False)
     except Exception:
         return False
 
@@ -506,7 +510,8 @@ def _run_jamf_pro_drift_check(te_state):
         te_entry = te_state.get(root.findtext("name_id"))
         if te_entry is None:
             continue
-        jamf_latest = root.findtext("versions/version/software_version")
+        raw_version = root.findtext("versions/version/software_version")
+        jamf_latest = " ".join(raw_version.split()) if raw_version else raw_version
         if jamf_latest != te_entry["version"]:
             drifted.append(
                 f"{te_entry['app']} (Jamf Pro has {jamf_latest}, "

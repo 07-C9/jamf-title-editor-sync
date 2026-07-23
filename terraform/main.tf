@@ -186,8 +186,10 @@ resource "aws_lambda_function" "patch_sync" {
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
-# Scheduled runs are idempotent and re-run within 12 hours; retrying a failed
-# async invocation only repeats the same failure and multiplies error noise.
+# Turns off retries on the async (event) invocation path only. The
+# scheduler-triggered path is governed separately by the scheduler target's
+# retry_policy below. Retries add no value here: runs are idempotent and re-run
+# within 12 hours, so a retry just repeats the same failure and adds noise.
 resource "aws_lambda_function_event_invoke_config" "patch_sync" {
   function_name          = aws_lambda_function.patch_sync.function_name
   maximum_retry_attempts = 0
@@ -384,7 +386,7 @@ resource "aws_cloudwatch_metric_alarm" "download_url_failures" {
   namespace           = "JamfPatchSync"
   metric_name         = "DownloadUrlCheckFailures"
   statistic           = "Maximum"
-  period              = 86400
+  period              = 43200
   evaluation_periods  = 1
   threshold           = 0
   comparison_operator = "GreaterThanThreshold"

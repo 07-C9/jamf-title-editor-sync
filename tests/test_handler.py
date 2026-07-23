@@ -1477,6 +1477,20 @@ class TestJamfProDriftCheck(unittest.TestCase):
                 drifted = self.handler._run_jamf_pro_drift_check(te_state)
         self.assertEqual(drifted, [])
 
+    def test_whitespace_in_jamf_version_is_collapsed_in_the_drift_line(self):
+        te_state = {"googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"}}
+        dirty = JAMF_PRO_XML_CHROME.replace(
+            "<software_version>150.0.7871.115</software_version>",
+            "<software_version>150.0.7871.115\n\tinjected</software_version>",
+        )
+        responses = self._drift_responses([dirty, JAMF_PRO_XML_SCREENCONNECT])
+        with patch("handler.urllib.request.urlopen", side_effect=responses):
+            with patch("handler.boto3.client", return_value=self.mock_secrets):
+                drifted = self.handler._run_jamf_pro_drift_check(te_state)
+        self.assertEqual(len(drifted), 1)
+        self.assertNotIn("\n", drifted[0])
+        self.assertNotIn("\t", drifted[0])
+
     def test_diverged_title_reported_with_both_versions(self):
         te_state = {
             "googlechrome": {"app": "Google Chrome", "version": "150.0.7871.115"},
@@ -2476,6 +2490,21 @@ class TestTitleEditorRejectionReason(unittest.TestCase):
         self.assertIn("DRC INSIGHT", message)
         self.assertIn("INVALID_CRITERIA", message)
 
+    def test_400_body_crlf_is_collapsed_out_of_the_alert(self):
+        handler = _reload_handler()
+
+        def fake(base, tok, method, path, body=None):
+            if method == "POST":
+                raise self._http_error(400, "line1\r\nline2\ninvalid criteria")
+            return {}
+
+        with patch("handler._title_editor_request", side_effect=fake):
+            with self.assertRaises(Exception) as ctx:
+                handler._update_title("https://te", "t", "11", "17.0.0", self._drc(handler), False)
+        message = str(ctx.exception)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\r", message)
+
     def test_an_oversized_400_body_is_bounded_before_it_reaches_the_alert(self):
         handler = _reload_handler()
 
@@ -2499,20 +2528,51 @@ class TestDownloadCanaryRetries(unittest.TestCase):
         resp.__exit__ = MagicMock(return_value=False)
         return resp
 
-    def test_transient_blip_is_retried_not_reported_as_dead(self):
+    def test_transient_5xx_is_retried_not_reported_as_dead(self):
         handler = _reload_handler()
         calls = []
 
         def urlopen(req, timeout=None):
             calls.append(1)
             if len(calls) == 1:
-                raise urllib.error.URLError(TimeoutError("timed out"))
+                raise urllib.error.HTTPError("https://x", 503, "busy", {}, io.BytesIO(b""))
             return self._resp(206)
 
         with patch("time.sleep"):
             with patch("handler.urllib.request.urlopen", side_effect=urlopen):
                 self.assertTrue(handler._url_is_live("https://ccmdls.adobe.test/x.dmg"))
         self.assertEqual(len(calls), 2)
+
+    def test_persistent_timeout_is_not_retried_so_the_run_budget_is_safe(self):
+        """The canary runs after the app loop; retrying a timeout would spend a
+        full socket-timeout budget twice per arch and can push the run past the
+        90s Lambda ceiling, losing the failure email. A timeout settles in one
+        attempt (5xx still retries, above)."""
+        handler = _reload_handler()
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(1)
+            raise TimeoutError("timed out")
+
+        with patch("time.sleep"):
+            with patch("handler.urllib.request.urlopen", side_effect=urlopen):
+                self.assertFalse(handler._url_is_live("https://ccmdls.adobe.test/x.dmg"))
+        self.assertEqual(len(calls), 1)
+
+    def test_config_fetch_does_not_retry_a_timeout(self):
+        handler = _reload_handler()
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(1)
+            raise TimeoutError("timed out")
+
+        with patch("time.sleep"):
+            with patch("handler.urllib.request.urlopen", side_effect=urlopen):
+                with self.assertRaises(RuntimeError):
+                    handler._http_get_text("https://x")
+        self.assertEqual(len(calls), 1)
 
     def test_a_real_404_is_dead_without_retrying(self):
         handler = _reload_handler()
@@ -2681,6 +2741,43 @@ class TestVersionDowngradeGuard(unittest.TestCase):
         with patch.object(self.handler, "_run_jamf_pro_drift_check", side_effect=spy):
             self._run("149.0.7827.54", "150.0.7871.190")
         self.assertEqual(captured["googlechrome"]["version"], "150.0.7871.190")
+
+
+class TestReviewHardening(unittest.TestCase):
+
+    def test_trailing_newline_version_is_rejected(self):
+        """re.match accepts a trailing newline (Python $ quirk); fullmatch does
+        not. A newline-suffixed version must not reach a Title Editor patch."""
+        handler = _reload_handler()
+        chrome = next(a for a in handler.APPS if a["name"] == "Google Chrome")
+        resp = _make_response({"releases": [{"version": "150.0.7871.190\n", "fraction": 1}]})
+        with patch("handler.urllib.request.urlopen", return_value=resp):
+            with self.assertRaises(ValueError) as ctx:
+                handler._fetch_latest_version(chrome)
+        self.assertIn("does not match pattern", str(ctx.exception))
+
+    def test_retry_error_detail_is_length_bounded(self):
+        handler = _reload_handler()
+
+        def fn():
+            raise ValueError("x" * 5000)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            handler._with_retries("version source GET https://v.test/x", fn)
+        self.assertNotIn("x" * 501, str(ctx.exception))
+
+    def test_min_version_error_value_is_length_bounded(self):
+        handler = _reload_handler()
+        cfg = {"url": "https://x.test/f", "json_path": ["v"]}
+        with patch("handler.urllib.request.urlopen",
+                   return_value=_make_response({"v": "y" * 5000})):
+            with self.assertRaises(ValueError) as ctx:
+                handler._fetch_minimum_accepted_version(cfg, "DRC INSIGHT")
+        self.assertNotIn("y" * 301, str(ctx.exception))
+
+    def test_null_current_version_is_not_a_downgrade(self):
+        handler = _reload_handler()
+        self.assertFalse(handler._is_version_downgrade("17.0.0", None))
 
 
 if __name__ == "__main__":
