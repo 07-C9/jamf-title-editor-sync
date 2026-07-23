@@ -1022,8 +1022,10 @@ class TestAdobeCanary(unittest.TestCase):
     def test_url_is_live_network_error(self):
         handler = _reload_handler()
         import urllib.error
-        with patch("handler.urllib.request.urlopen", side_effect=urllib.error.URLError("boom")):
-            self.assertFalse(handler._url_is_live("https://ccmdls.adobe.com/x.dmg"))
+        with patch("time.sleep"):
+            with patch("handler.urllib.request.urlopen",
+                       side_effect=urllib.error.URLError("boom")):
+                self.assertFalse(handler._url_is_live("https://ccmdls.adobe.com/x.dmg"))
 
     def test_run_download_checks_all_healthy(self):
         handler = _reload_handler()
@@ -2429,6 +2431,256 @@ class TestAppsJsonIntegrity(unittest.TestCase):
         handler = _reload_handler()
         drc = next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
         self.assertEqual(drc["minimum_accepted_version"]["known"], "16.0.0")
+
+
+class TestTitleEditorRejectionReason(unittest.TestCase):
+    """A 400 from the patch POST carried the real reason in its body, which was
+    read for the duplicate check and then thrown away, so the alert only said
+    'Bad Request'."""
+
+    def _http_error(self, code, body):
+        return urllib.error.HTTPError(
+            "https://te/x", code, "msg", {}, io.BytesIO(body.encode())
+        )
+
+    def _drc(self, handler):
+        return next(a for a in handler.APPS if a["name"] == "DRC INSIGHT")
+
+    def test_duplicate_record_400_still_skips_to_the_put(self):
+        handler = _reload_handler()
+        methods = []
+
+        def fake(base, tok, method, path, body=None):
+            methods.append(method)
+            if method == "POST":
+                raise self._http_error(400, '{"errors":[{"code":"DUPLICATE_RECORD"}]}')
+            return {}
+
+        with patch("handler._title_editor_request", side_effect=fake):
+            handler._update_title("https://te", "t", "11", "17.0.0", self._drc(handler), False)
+        self.assertEqual(methods, ["POST", "PUT"])
+
+    def test_non_duplicate_400_surfaces_the_server_reason(self):
+        handler = _reload_handler()
+
+        def fake(base, tok, method, path, body=None):
+            if method == "POST":
+                raise self._http_error(400, '{"errors":[{"code":"INVALID_CRITERIA",'
+                                             '"description":"criteria are invalid"}]}')
+            return {}
+
+        with patch("handler._title_editor_request", side_effect=fake):
+            with self.assertRaises(Exception) as ctx:
+                handler._update_title("https://te", "t", "11", "17.0.0", self._drc(handler), False)
+        message = str(ctx.exception)
+        self.assertIn("DRC INSIGHT", message)
+        self.assertIn("INVALID_CRITERIA", message)
+
+    def test_an_oversized_400_body_is_bounded_before_it_reaches_the_alert(self):
+        handler = _reload_handler()
+
+        def fake(base, tok, method, path, body=None):
+            if method == "POST":
+                raise self._http_error(400, "x" * 5000)
+            return {}
+
+        with patch("handler._title_editor_request", side_effect=fake):
+            with self.assertRaises(Exception) as ctx:
+                handler._update_title("https://te", "t", "11", "17.0.0", self._drc(handler), False)
+        self.assertLessEqual(len(str(ctx.exception)), 600)
+
+
+class TestDownloadCanaryRetries(unittest.TestCase):
+
+    def _resp(self, status):
+        resp = MagicMock()
+        resp.status = status
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_transient_blip_is_retried_not_reported_as_dead(self):
+        handler = _reload_handler()
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise urllib.error.URLError(TimeoutError("timed out"))
+            return self._resp(206)
+
+        with patch("time.sleep"):
+            with patch("handler.urllib.request.urlopen", side_effect=urlopen):
+                self.assertTrue(handler._url_is_live("https://ccmdls.adobe.test/x.dmg"))
+        self.assertEqual(len(calls), 2)
+
+    def test_a_real_404_is_dead_without_retrying(self):
+        handler = _reload_handler()
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(1)
+            raise urllib.error.HTTPError("https://x", 404, "Not Found", {}, None)
+
+        with patch("handler.urllib.request.urlopen", side_effect=urlopen):
+            self.assertFalse(handler._url_is_live("https://x"))
+        self.assertEqual(len(calls), 1)
+
+    def test_config_fetch_retries_a_transient_blip(self):
+        handler = _reload_handler()
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError("https://x", 503, "busy", {}, io.BytesIO(b""))
+            return _make_response("<config/>", raw=True)
+
+        with patch("time.sleep"):
+            with patch("handler.urllib.request.urlopen", side_effect=urlopen):
+                self.assertEqual(handler._http_get_text("https://x"), "<config/>")
+        self.assertEqual(len(calls), 2)
+
+
+class TestBlockedDowngradeInFailureEmail(unittest.TestCase):
+
+    def _results(self):
+        return [
+            {"app": "GMetrix SMSe", "status": "failed", "error": "boom"},
+            {"app": "Google Chrome", "status": "regression_blocked",
+             "from": "150.0.7871.190", "blocked": "149.0.7827.54"},
+        ]
+
+    def test_blocked_downgrade_is_named_when_another_item_failed(self):
+        handler = _reload_handler()
+        _, body = handler._build_failure_alert(self._results(), ["GMetrix SMSe"], [], "r1")
+        self.assertIn("Version downgrade refused", body)
+        self.assertIn("kept 150.0.7871.190, refused 149.0.7827.54", body)
+        self.assertNotIn("Only the items under 'Failed'", body)
+
+
+class TestVersionDowngradeDetection(unittest.TestCase):
+
+    def test_lower_candidate_is_a_downgrade(self):
+        handler = _reload_handler()
+        self.assertTrue(handler._is_version_downgrade("16.0.0", "17.0.0"))
+        self.assertTrue(handler._is_version_downgrade("17.0.0", "17.0.1"))
+
+    def test_higher_or_equal_candidate_is_not_a_downgrade(self):
+        handler = _reload_handler()
+        self.assertFalse(handler._is_version_downgrade("17.0.0", "16.0.0"))
+        self.assertFalse(handler._is_version_downgrade("17.0.1", "17.0.0"))
+        self.assertFalse(handler._is_version_downgrade("17.0.0", "17.0.0"))
+
+    def test_comparison_is_numeric_not_lexical(self):
+        handler = _reload_handler()
+        self.assertTrue(handler._is_version_downgrade("9.0.0", "10.0.0"))
+        self.assertFalse(handler._is_version_downgrade("10.0.0", "9.0.0"))
+
+    def test_differing_part_counts_pad_with_zero(self):
+        handler = _reload_handler()
+        self.assertFalse(handler._is_version_downgrade("18.0", "18.0.0"))
+        self.assertTrue(handler._is_version_downgrade("18.0", "18.0.1"))
+
+    def test_unparseable_versions_are_not_treated_as_a_downgrade(self):
+        """Fail open: an unexpected shape must not block a legitimate update.
+        version_pattern already gates the candidate, so this only guards the
+        genuinely unexpected."""
+        handler = _reload_handler()
+        self.assertFalse(handler._is_version_downgrade("2024-01", "2024-02"))
+        self.assertFalse(handler._is_version_downgrade("17.0.0", ""))
+
+
+class TestVersionDowngradeGuard(unittest.TestCase):
+    """A vendor serving an older version than Title Editor already holds would,
+    unguarded, be written straight through as the new current version and then
+    ingested by Jamf Pro, pointing patch reporting backwards. The guard refuses
+    the write, alarms, and leaves the definition where it is."""
+
+    def setUp(self):
+        self.handler = _reload_handler()
+        self._apps = self.handler.APPS
+        self.handler.APPS = [a for a in self.handler.APPS if a["name"] == "Google Chrome"]
+        self.addCleanup(setattr, self.handler, "APPS", self._apps)
+        _disable_download_checks(self)
+        os.environ.pop("JAMF_PRO_URL", None)
+        os.environ.pop("JAMF_PRO_SECRET_ID", None)
+        os.environ["ALERT_TOPIC_ARN"] = "arn:aws:sns:us-west-2:111122223333:test-alerts"
+        self.addCleanup(os.environ.pop, "ALERT_TOPIC_ARN", None)
+        self.mock_ssm = MagicMock()
+        self.mock_ssm.get_parameter.side_effect = [
+            {"Parameter": {"Value": "u"}}, {"Parameter": {"Value": "p"}},
+        ]
+        self.cloudwatch = MagicMock()
+        self.mock_sns = MagicMock()
+
+    def _router(self):
+        def route(svc):
+            return {"ssm": self.mock_ssm, "cloudwatch": self.cloudwatch,
+                    "sns": self.mock_sns}.get(svc, MagicMock())
+        return route
+
+    def _metric(self, name):
+        return [
+            c.kwargs["MetricData"][0]["Value"]
+            for c in self.cloudwatch.put_metric_data.call_args_list
+            if c.kwargs["MetricData"][0]["MetricName"] == name
+        ]
+
+    def _run(self, vendor_version, te_current):
+        responses = [
+            _make_response({"token": "t"}),
+            _make_response({"releases": [{"version": vendor_version, "fraction": 1}]}),
+            _make_response({"currentVersion": te_current, "enabled": True,
+                            "id": "googlechrome", "patches": [{"version": te_current}]}),
+            # a POST and PUT are queued but must go unused when the guard fires
+            _make_response({"patchId": 1}),
+            _make_response({"currentVersion": vendor_version}),
+        ]
+        with patch("handler.urllib.request.urlopen", side_effect=responses) as urlopen:
+            with patch("handler.boto3.client", side_effect=self._router()):
+                result = self.handler.lambda_handler({}, None)
+        return result, urlopen
+
+    def test_downgrade_is_not_written_and_run_still_succeeds(self):
+        result, urlopen = self._run("149.0.7827.54", "150.0.7871.190")
+        self.assertEqual(result["statusCode"], 200)
+        # GET token, GET version, GET title only. No POST, no PUT.
+        self.assertEqual(urlopen.call_count, 3)
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "regression_blocked")
+        self.assertEqual(entry["from"], "150.0.7871.190")
+        self.assertEqual(entry["blocked"], "149.0.7827.54")
+
+    def test_downgrade_emits_the_metric_but_no_email_on_its_own(self):
+        self._run("149.0.7827.54", "150.0.7871.190")
+        self.assertEqual(self._metric("VersionRegressionBlocked"), [1])
+        self.mock_sns.publish.assert_not_called()
+
+    def test_a_real_upgrade_is_still_written_normally(self):
+        result, urlopen = self._run("150.0.7871.190", "149.0.7827.54")
+        self.assertEqual(result["results"][0]["status"], "updated")
+        self.assertEqual(urlopen.call_count, 5)
+        self.assertEqual(self._metric("VersionRegressionBlocked"), [0])
+
+    def test_blocked_app_reports_the_held_version_to_the_drift_check(self):
+        """te_state must carry what Title Editor still holds (the higher
+        version), not the rejected one, or the drift check would chase a value
+        that was never written."""
+        captured = {}
+        orig = self.handler._run_jamf_pro_drift_check
+
+        def spy(te_state):
+            captured.update(te_state)
+            return []
+
+        os.environ["JAMF_PRO_URL"] = "https://jamf.test:8443"
+        os.environ["JAMF_PRO_SECRET_ID"] = "s"
+        self.addCleanup(os.environ.pop, "JAMF_PRO_URL", None)
+        self.addCleanup(os.environ.pop, "JAMF_PRO_SECRET_ID", None)
+        with patch.object(self.handler, "_run_jamf_pro_drift_check", side_effect=spy):
+            self._run("149.0.7827.54", "150.0.7871.190")
+        self.assertEqual(captured["googlechrome"]["version"], "150.0.7871.190")
 
 
 if __name__ == "__main__":

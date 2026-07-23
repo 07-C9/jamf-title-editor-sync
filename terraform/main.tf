@@ -362,6 +362,22 @@ resource "aws_cloudwatch_metric_alarm" "minimum_version_changed" {
   ok_actions    = [aws_sns_topic.alerts.arn]
 }
 
+resource "aws_cloudwatch_metric_alarm" "version_regression_blocked" {
+  alarm_name          = "${var.project_name}-version-regression-blocked"
+  alarm_description   = "A vendor served a version older than the one Title Editor already holds, and the Lambda refused to write it. Left unblocked this would set a lower current version that Jamf Pro ingests, pointing patch reporting backwards. The definition was NOT changed; it still holds the higher version. This is usually the vendor's feed briefly serving a stale build (GitHub /releases/latest returns the most recently created release, not the highest; Chrome's fraction=1 can re-serve an older stable), which self-resolves on the next run. If the vendor genuinely pulled a build and you want to follow it down, lower currentVersion in Title Editor by hand. The sync Lambda's 'refusing to downgrade' log lines name the app, the served version and the held version. Missing data holds state rather than clearing it, because the metric is only published on a completed run."
+  namespace           = "JamfPatchSync"
+  metric_name         = "VersionRegressionBlocked"
+  statistic           = "Maximum"
+  period              = 43200
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "ignore"
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+  ok_actions    = [aws_sns_topic.alerts.arn]
+}
+
 resource "aws_cloudwatch_metric_alarm" "download_url_failures" {
   alarm_name          = "${var.project_name}-download-url-failures"
   alarm_description   = "An Installomator download URL went dark (e.g. Adobe CC build-path change). The Lambda's _run_download_checks emits DownloadUrlCheckFailures; inspect the Lambda logs for which arch/URL failed."

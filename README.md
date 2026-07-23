@@ -14,7 +14,7 @@ An AWS Lambda runs twice a day (6 AM and 6 PM Pacific by default). For each app 
 
 1. Checks the vendor's version API for the latest release
 2. Compares that against what Title Editor currently has
-3. If they differ, it adds the new version and sets it as current
+3. If the vendor version is newer, it adds that version and sets it as current; if it is older than what Title Editor already holds, it refuses the write and alarms rather than downgrade the definition
 4. Jamf Pro picks up the change within about 30 minutes
 
 Each app has its own version source URL, version format regex, and patch template defined in `apps.json`. Adding a new app is a config change.
@@ -524,19 +524,20 @@ terraform apply
 
 ## Monitoring
 
-Five CloudWatch alarms, all emailing via SNS:
+Six CloudWatch alarms, all emailing via SNS:
 
 - Errors: Lambda threw an exception (auth failure, API error, code bug)
 - Duration: Execution approaching the 90-second timeout
 - No invocations (24h): Scheduler stopped firing (deleted, misconfigured)
 - Download-URL failure: the canary found a dead installer URL (e.g. an Adobe CC build-path change), reported via the `DownloadUrlCheckFailures` metric
 - Minimum version changed: a vendor moved the lowest version it will still accept, reported via the `MinimumVersionChanged` metric
+- Version regression blocked: a vendor served a version older than Title Editor holds and the sync refused to write it, reported via the `VersionRegressionBlocked` metric
 
 When a run fails, the Lambda also emails the detail to the same topic before it raises: which apps failed and why, what succeeded, and a link to the logs. The alarm email only says the run broke; the detail email says which app and what error.
 
 The Errors and Duration alarms ignore missing data because the function only runs twice a day. Once one fires it stays in ALARM until a later run posts a clean datapoint, so an OK email means a later run came back clean. Async retries are off; retrying a broken version source a minute later fails the same way, so a failed run just waits for the next scheduled one.
 
-An optional sixth alarm watches whether Jamf Pro is actually ingesting what the Lambda pushes. When `jamf_pro_url` and `jamf_pro_secret_name` are set in `terraform.tfvars` (a read-only Jamf Pro API client with the patch read privileges, stored in Secrets Manager as JSON keys `client_id` and `client_secret`), each run compares Jamf Pro's latest ingested definition per title against Title Editor and emits a `JamfProDefinitionLag` metric. Lag right after a push is normal, so the alarm fires only when a title stays diverged across two consecutive runs. That pattern is what a dropped Title Editor connection looks like, and since Jamf Pro 11.28 the connection cannot re-establish itself; the fix is re-saving the external patch source in Jamf Pro settings.
+An optional seventh alarm watches whether Jamf Pro is actually ingesting what the Lambda pushes. When `jamf_pro_url` and `jamf_pro_secret_name` are set in `terraform.tfvars` (a read-only Jamf Pro API client with the patch read privileges, stored in Secrets Manager as JSON keys `client_id` and `client_secret`), each run compares Jamf Pro's latest ingested definition per title against Title Editor and emits a `JamfProDefinitionLag` metric. Lag right after a push is normal, so the alarm fires only when a title stays diverged across two consecutive runs. That pattern is what a dropped Title Editor connection looks like, and since Jamf Pro 11.28 the connection cannot re-establish itself; the fix is re-saving the external patch source in Jamf Pro settings.
 
 ### When you get an alert
 
@@ -547,6 +548,7 @@ An optional sixth alarm watches whether Jamf Pro is actually ingesting what the 
 | Duration | Slow API response | Consider bumping the Lambda timeout |
 | Download-URL failure | Vendor changed or pulled an installer URL | Check CloudWatch Logs for the failing arch/URL, fix the Installomator label, re-verify |
 | Definition lag | Jamf Pro stopped pulling from Title Editor | Re-save the external patch source in Jamf Pro settings, then confirm the next runs post JamfProDefinitionLag=0 |
+| Version regression blocked | Vendor served an older version than Title Editor holds | Usually a feed briefly serving a stale build; it self-resolves next run. To follow a genuinely pulled build down, lower currentVersion in Title Editor by hand |
 | Minimum version changed | Vendor moved the lowest version it still accepts | Confirm the new number and that the required version is deployed, then update `known` in `lambda/apps.json` and redeploy to acknowledge |
 
 ## Security

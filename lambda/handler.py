@@ -237,6 +237,22 @@ def _fetch_minimum_accepted_version(config, app_name):
     return data
 
 
+def _is_version_downgrade(candidate, current):
+    """True only when candidate is confidently lower than current, comparing
+    dotted numbers part by part with absent trailing parts treated as zero.
+    Fails open: any shape it cannot parse returns False so a legitimate update
+    is never blocked by a comparison it does not understand."""
+    try:
+        c = [int(p) for p in candidate.split(".")]
+        h = [int(p) for p in current.split(".")]
+    except (ValueError, AttributeError):
+        return False
+    width = max(len(c), len(h))
+    c += [0] * (width - len(c))
+    h += [0] * (width - len(h))
+    return c < h
+
+
 def _fetch_latest_version(app_config):
     source = app_config["version_source"]
     source_type = source["type"]
@@ -319,12 +335,19 @@ def _update_title(base_url, token, title_id, version, app_config, patch_exists=F
             )
             logger.info(f"Added patch version {version} for {app_config['name']}")
         except urllib.error.HTTPError as e:
-            if e.code in (400, 409):
-                body = e.read().decode() if hasattr(e, 'read') else ""
-                if e.code == 409 or "DUPLICATE_RECORD" in body:
-                    logger.info(f"Version {version} already exists for {app_config['name']}, skipping POST")
-                else:
-                    raise
+            body = e.read().decode(errors="replace") if e.code in (400, 409) else ""
+            if e.code == 409 or (e.code == 400 and "DUPLICATE_RECORD" in body):
+                logger.info(f"Version {version} already exists for {app_config['name']}, skipping POST")
+            elif e.code == 400:
+                # The body names the real reason (a criteria or EA problem); the
+                # drained HTTPError would only say "Bad Request", so carry it.
+                # Collapse whitespace (neutralises CRLF in the alert) and bound
+                # the length, since this is external data headed for an email.
+                detail = " ".join(body.split())[:500] or "Bad Request"
+                raise RuntimeError(
+                    f"Title Editor rejected patch {version} for "
+                    f"{app_config['name']}: {detail}"
+                ) from e
             else:
                 raise
 
@@ -341,9 +364,12 @@ def _update_title(base_url, token, title_id, version, app_config, patch_exists=F
 
 
 def _http_get_text(url, timeout=15):
-    req = urllib.request.Request(url, headers={"Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode()
+    def fetch():
+        req = urllib.request.Request(url, headers={"Accept": "*/*"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode()
+
+    return _with_retries(f"download config GET {url}", fetch)
 
 
 def _adobe_ccd_download_url(cc_arch):
@@ -365,13 +391,21 @@ def _adobe_ccd_download_url(cc_arch):
 
 
 def _url_is_live(url, timeout=20):
-    # 1-byte range request; confirm the object exists without pulling the ~311 MB body
-    req = urllib.request.Request(url, method="GET", headers={"Range": "bytes=0-0"})
+    # 1-byte range request; confirm the object exists without pulling the ~311 MB
+    # body. A transient blip is retried rather than read as a dead URL; a
+    # definite HTTP answer (e.g. 404) settles it without retrying.
+    def fetch():
+        req = urllib.request.Request(url, method="GET", headers={"Range": "bytes=0-0"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status in (200, 206)
+        except urllib.error.HTTPError as e:
+            if e.code in TRANSIENT_HTTP_STATUSES:
+                raise
+            return e.code in (200, 206)
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status in (200, 206)
-    except urllib.error.HTTPError as e:
-        return e.code in (200, 206)
+        return _with_retries(f"download URL check {url}", fetch)
     except Exception:
         return False
 
@@ -521,11 +555,14 @@ def _build_failure_alert(results, failures, download_failures, request_id):
         subject = subject[:97] + "..."
 
     changed = [r for r in results if r.get("status") == "changed"]
+    blocked = [r for r in results if r.get("status") == "regression_blocked"]
+    extra = ["'Failed'"]
     if changed:
-        intro = (
-            f"{function_name} run failed. Items under 'Failed' and 'Vendor minimum "
-            f"version changed' both need attention."
-        )
+        extra.append("'Vendor minimum version changed'")
+    if blocked:
+        extra.append("'Version downgrade refused'")
+    if len(extra) > 1:
+        intro = f"{function_name} run failed. Items under {' and '.join(extra)} need attention."
     else:
         intro = f"{function_name} run failed. Only the items under 'Failed' need attention."
     lines = [intro, ""]
@@ -547,6 +584,12 @@ def _build_failure_alert(results, failures, download_failures, request_id):
         lines.append("Vendor minimum version changed (nothing on disk changed; the bar moved):")
         for r in changed:
             lines.append(f"  - {r['detail']}")
+
+    if blocked:
+        lines.append("")
+        lines.append("Version downgrade refused (vendor served older than Title Editor holds):")
+        for r in blocked:
+            lines.append(f"  - {r['app']}: kept {r['from']}, refused {r['blocked']}")
 
     app_results = [r for r in results if "app" in r]
     ok = [r for r in app_results if r.get("status") in ("current", "updated")]
@@ -599,6 +642,7 @@ def lambda_handler(event, context):
     results = []
     failures = []
     te_state = {}
+    regressions = 0
     for app in APPS:
         if not app.get("enabled", True):
             logger.info(f"Skipping disabled app: {app['name']}")
@@ -610,17 +654,34 @@ def lambda_handler(event, context):
             title_info = _get_title_info(base_url, token, title_id)
             current = title_info.get("currentVersion", "")
 
+            confirmed = current
             if latest == current:
                 logger.info(f"{app['name']}: up to date at {current}")
                 results.append({"app": app["name"], "status": "current", "version": current})
+            elif _is_version_downgrade(latest, current):
+                # The vendor answer went backwards. Writing it would set a lower
+                # current version that Jamf Pro then ingests, pointing patch
+                # reporting the wrong way. Refuse it and alarm; the definition
+                # stays where it is. To follow a genuinely pulled build down,
+                # lower currentVersion in Title Editor by hand.
+                logger.warning(
+                    f"{app['name']}: vendor version {latest} is older than "
+                    f"Title Editor's {current}; refusing to downgrade"
+                )
+                regressions += 1
+                results.append({
+                    "app": app["name"], "status": "regression_blocked",
+                    "from": current, "blocked": latest,
+                })
             else:
                 existing_versions = {p["version"] for p in title_info.get("patches", [])}
                 logger.info(f"{app['name']}: updating {current} -> {latest}")
                 _update_title(base_url, token, title_id, latest, app, latest in existing_versions)
                 results.append({"app": app["name"], "status": "updated", "from": current, "to": latest})
+                confirmed = latest
 
             if title_info.get("id"):
-                te_state[title_info["id"]] = {"app": app["name"], "version": latest}
+                te_state[title_info["id"]] = {"app": app["name"], "version": confirmed}
 
         except Exception as e:
             logger.error(f"{app['name']}: failed - {e}")
@@ -633,6 +694,7 @@ def lambda_handler(event, context):
         results.append({"check": "download_url", "status": "failed", "detail": failure})
 
     _publish_metric("DownloadUrlCheckFailures", len(download_failures))
+    _publish_metric("VersionRegressionBlocked", regressions)
 
     if os.environ.get("JAMF_PRO_URL") and os.environ.get("JAMF_PRO_SECRET_ID"):
         try:
